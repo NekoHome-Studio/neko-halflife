@@ -218,4 +218,4 @@ class ActivationStore:
         )
         for victim in ordered[: len(table) - self.max_per_session]:
             table.pop(victim.name, None)
-            logger.debug("[lazy-tools] 激活表满员，淘汰 %s（分 %.3f）", victim.name, victim.score)
+            logger.debug("[neko-halflife] 激活表满员，淘汰 %s（分 %.3f）", victim.name, victim.score)

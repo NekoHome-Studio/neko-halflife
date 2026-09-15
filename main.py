@@ -95,7 +95,7 @@ class LazyToolsPlugin(Star):
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         logger.info(
-            "[lazy-tools] 就绪：懒加载工具 %d 个（其中常驻元工具 %d 个），"
+            "[neko-halflife] 就绪：懒加载工具 %d 个（其中常驻元工具 %d 个），"
             "子插件 %d 个，索引 %d 条；预检索=%s，阈值=%.2f，top_k=%d",
             len(REGISTRY.candidates()),
             len(REGISTRY.always_active()),
@@ -109,7 +109,7 @@ class LazyToolsPlugin(Star):
     async def terminate(self) -> None:
         """卸载清理。注册表是模块级单例，这里只清会话状态，不动工具定义。"""
         self._turns.clear()
-        logger.info("[lazy-tools] 已卸载，会话状态已清理")
+        logger.info("[neko-halflife] 已卸载，会话状态已清理")
 
     # ------------------------------------------------------------------
     # 核心：每轮请求前的注入决策
@@ -130,7 +130,7 @@ class LazyToolsPlugin(Star):
             self._decide(event, req)
         except Exception as exc:  # noqa: BLE001 - 注入失败不能让整轮对话崩掉
             logger.error(
-                "[lazy-tools] 本轮注入失败，保持原工具集不变：%s", exc, exc_info=True
+                "[neko-halflife] 本轮注入失败，保持原工具集不变：%s", exc, exc_info=True
             )
 
     def _decide(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -200,7 +200,7 @@ class LazyToolsPlugin(Star):
         if self._debug:
             active = sorted(self.activation.names(umo))
             logger.info(
-                "[lazy-tools] %s 许可 %d 项 | 预检索命中 %s | 本轮激活 %s | 裁掉 %d 项",
+                "[neko-halflife] %s 许可 %d 项 | 预检索命中 %s | 本轮激活 %s | 裁掉 %d 项",
                 umo,
                 len(allowed),
                 [f"{m.name}:{s:.2f}" for m, s in hits] or "无",
@@ -408,7 +408,7 @@ class LazyToolsPlugin(Star):
                     f"/{PLUGIN_NAME}/{suffix}", handler, methods, description
                 )
             except Exception as exc:  # noqa: BLE001 - 注册失败不该拖垮插件加载
-                logger.error("[lazy-tools] 注册 Web API %s 失败：%s", suffix, exc)
+                logger.error("[neko-halflife] 注册 Web API %s 失败：%s", suffix, exc)
 
     async def page_state(self):
         """总览：配置、统计、工具清单、子插件与各会话激活表。"""
@@ -618,7 +618,7 @@ class LazyToolsPlugin(Star):
         for name, ok in result.items():
             if not ok:
                 logger.warning(
-                    "[lazy-tools] 子插件 %s 加载失败：%s",
+                    "[neko-halflife] 子插件 %s 加载失败：%s",
                     name,
                     self.loader.errors.get(name, "未知原因"),
                 )
@@ -659,7 +659,7 @@ class LazyToolsPlugin(Star):
             if callable(save):
                 save()
         except Exception as exc:  # noqa: BLE001 - 落盘失败只影响持久化，不影响本次运行
-            logger.warning("[lazy-tools] 子插件状态写入配置失败（仅本次运行生效）：%s", exc)
+            logger.warning("[neko-halflife] 子插件状态写入配置失败（仅本次运行生效）：%s", exc)
 
     @staticmethod
     def _clamp_int(value: Any, *, default: int, low: int, high: int) -> int:

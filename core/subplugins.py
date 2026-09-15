@@ -117,11 +117,11 @@ class SubPluginLoader:
                 pop_source(token)
         except Exception as exc:  # noqa: BLE001 - 子插件出错不能拖垮主插件
             self.errors[name] = f"{type(exc).__name__}: {exc}"
-            logger.error("[lazy-tools] 子插件 %s 加载失败：%s", name, exc, exc_info=True)
+            logger.error("[neko-halflife] 子插件 %s 加载失败：%s", name, exc, exc_info=True)
             return False
         self.errors.pop(name, None)
         self.loaded.add(name)
-        logger.info("[lazy-tools] 子插件 %s 已加载（%s）", name, path.name)
+        logger.info("[neko-halflife] 子插件 %s 已加载（%s）", name, path.name)
         return True
 
     def load_all(self, disabled: Iterable[str] | None = None) -> dict[str, bool]:
@@ -148,7 +148,7 @@ class SubPluginLoader:
         for stale in self.registry.sources():
             if stale not in result:
                 self.registry.forget_source(stale)
-                logger.info("[lazy-tools] 子插件 %s 已移除", stale)
+                logger.info("[neko-halflife] 子插件 %s 已移除", stale)
         return result
 
     def set_enabled(self, name: str, enabled: bool) -> bool:

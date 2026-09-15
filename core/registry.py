@@ -115,10 +115,10 @@ class ToolRegistry:
         if previous is not None:
             if previous.module == meta.module:
                 # 同一个模块被重新导入（插件重载、子插件启停）——覆盖即可，不算冲突。
-                logger.debug("[lazy-tools] 重载工具元数据：%s", meta.name)
+                logger.debug("[neko-halflife] 重载工具元数据：%s", meta.name)
             else:
                 logger.warning(
-                    "[lazy-tools] 工具名冲突，%s 覆盖了 %s 的同名工具：%s",
+                    "[neko-halflife] 工具名冲突，%s 覆盖了 %s 的同名工具：%s",
                     meta.module,
                     previous.module,
                     meta.name,
@@ -242,7 +242,7 @@ def lazy_tool(
 
         registered = event_filter.llm_tool(name=name)(wrapped)
         REGISTRY.register(meta)
-        logger.debug("[lazy-tools] 已注册懒加载工具：%s", meta.name)
+        logger.debug("[neko-halflife] 已注册懒加载工具：%s", meta.name)
         return registered
 
     return decorator

@@ -449,6 +449,41 @@ def main() -> int:
         "metadata.astrbot_version 已声明",
     )
 
+    print()
+    print("13. 无改名残留（连字符与下划线两种写法都要查）")
+    # 两处易漏点：日志前缀用的是连字符 [lazy-tools]，项目标识用的是下划线。
+    # 只 grep 其中一种会得到「干净」的假结论。模式分段拼接，避免本文件自身命中。
+    stale_patterns = ("[lazy" + "-tools]", "astrbot_plugin_" + "lazy_tools")
+    _TEXT_SUFFIXES = {".py", ".json", ".yaml", ".yml", ".js", ".html", ".md"}
+    _SELF = Path(__file__).resolve()
+    scanned = [
+        path
+        for path in PLUGIN_ROOT.rglob("*")
+        if path.is_file()
+        and path.suffix in _TEXT_SUFFIXES
+        and "__pycache__" not in path.parts
+        and ".git" not in path.parts
+        and "dist" not in path.parts
+        and path.resolve() != _SELF
+    ]
+    check(len(scanned) >= 10, f"扫描了 {len(scanned)} 个文本文件")
+
+    offenders = [
+        f"{path.relative_to(PLUGIN_ROOT)}: {pattern}"
+        for path in scanned
+        for pattern in stale_patterns
+        if pattern in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    check(not offenders, f"无旧标识残留（命中 {offenders or '无'}）")
+
+    # 反向断言：新前缀确实在用。否则上一条会因为「压根不存在任何前缀」而假通过。
+    prefix_hits = sum(
+        path.read_text(encoding="utf-8", errors="ignore").count("[neko-halflife]")
+        for path in scanned
+        if path.suffix == ".py"
+    )
+    check(prefix_hits >= 10, f"新日志前缀 [neko-halflife] 实际出现 {prefix_hits} 处")
+
     total = _PASSED + len(_FAILED)
     print()
     print(f"通过 {_PASSED}/{total}")
