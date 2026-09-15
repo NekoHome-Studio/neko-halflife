@@ -38,13 +38,16 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 #: 当成包加载即可，测试因此与所在目录名解耦。
 PKG_ALIAS = "neko_halflife_under_test"
 
+#: 找不到源码时的候选路径。只用「家目录下的 Downloads」这种通用位置，
+#: 不硬编码任何具体机器的用户名——这是公开仓库，别人 clone 下来跑得通才算数。
 _DEFAULT_ROOTS = (
-    r"C:\Users\haoxu\Downloads\AstrBot-master",
-    str(Path.home() / "Downloads" / "AstrBot-master"),
+    Path.home() / "Downloads" / "AstrBot-master",
+    Path.home() / "AstrBot",
+    Path.home() / "Downloads" / "AstrBot",
 )
 ASTRBOT_SRC = os.environ.get("ASTRBOT_SRC", "")
 if not ASTRBOT_SRC:
-    ASTRBOT_SRC = next((p for p in _DEFAULT_ROOTS if Path(p).is_dir()), "")
+    ASTRBOT_SRC = str(next((p for p in _DEFAULT_ROOTS if Path(p).is_dir()), ""))
 
 if not ASTRBOT_SRC:
     print("跳过：未找到 AstrBot 源码根目录，请设置 ASTRBOT_SRC")

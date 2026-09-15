@@ -319,3 +319,14 @@ python tests/smoke_astrbot.py
   `/api/v1/plugins/extensions/<metadata.name>/<endpoint>`。
 
 `tests/smoke_astrbot.py` 就是为这件事写的——升级后先跑它。
+
+---
+
+## 许可
+
+本项目采用 **MIT License**，见 [LICENSE](LICENSE)（Copyright (c) 2026 NekoHome-Studio）。
+
+`docs/` 下的《AstrBot插件懒加载-按需工具注入-总结.md》是**实现前的初版设计文档**，
+保留它是为了记录当初的设计取舍。它与最终实现有三处不一致（虚构配置名、
+成员级隔离开关的真实名称、重新注入会绕过上游过滤），已在本文档的
+「三处设计修正」一节逐条说明——**以代码与本文档为准，设计文档仅作历史参考**。
