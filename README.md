@@ -1,6 +1,6 @@
 # 薛定谔的工具箱 · Neko Half-Life
 
-> 仓库：`Nekohome-cc/neko-halflife` · AstrBot 插件（`metadata.name = astrbot_plugin_neko_halflife`）
+> 仓库：`NekoHome-Studio/neko-halflife` · AstrBot 插件（`metadata.name = astrbot_plugin_neko_halflife`）
 >
 > 工具照常注册，说明书按需注入；本地检索先激活，再把 Schema 给模型看。
 > 省的是提示词预算与上下文窗口，**不省工具执行算力**。
@@ -54,7 +54,7 @@ AstrBot 4.26.7 自带 `provider_settings.tool_schema_mode = skills_like | full`
 在 AstrBot WebUI 的插件管理里用仓库地址安装：
 
 ```
-https://github.com/Nekohome-cc/neko-halflife
+https://github.com/NekoHome-Studio/neko-halflife
 ```
 
 AstrBot 会按 `metadata.name` 把目录重命名为 `astrbot_plugin_neko_halflife`，
@@ -64,7 +64,7 @@ AstrBot 会按 `metadata.name` 把目录重命名为 `astrbot_plugin_neko_halfli
 
 ```
 cd <AstrBot>/data/plugins
-git clone https://github.com/Nekohome-cc/neko-halflife astrbot_plugin_neko_halflife
+git clone https://github.com/NekoHome-Studio/neko-halflife astrbot_plugin_neko_halflife
 ```
 
 装好后在 WebUI 插件管理里重载即可。无第三方依赖，不需要 `requirements.txt`。
