@@ -9,6 +9,9 @@ venv/
 # tests/smoke_astrbot.py 会把 AstrBot 的 data/ 重定向到这里，跑完自动删除
 .smoke-astrbot-root/
 
+# ---- 版本兼容性验证用的 AstrBot 源码副本（见 README「版本敏感」）----
+.verify/
+
 # ---- 工作区遗留，不属于插件本体 ----
 dsh-plugin-dev-main/
 dsh-plugin-dev-main.zip

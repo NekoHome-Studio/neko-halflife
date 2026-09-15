@@ -89,6 +89,11 @@ AstrBot 的更新流程是「下载 → 校验 → 删除旧目录 → 解包」
 要更新只能二选一：走「更新」，或者先删掉 `data/plugins/astrbot_plugin_neko_halflife/`
 再上传安装包。
 
+> 补充：AstrBot **4.28.1** 的更新日志里有
+> `Fixed plugin updates through URL and file installation. (#10053)`，
+> 说明 4.27.x 上「通过 URL 或文件安装来更新插件」确实有缺陷。如果你在 4.27.x
+> 撞到本节描述的报错，升级 AstrBot 本身也可能直接解决。
+
 手动替换也可以（解包后重载插件）：
 
 ```bash
@@ -332,7 +337,7 @@ python tests/smoke_astrbot.py
 
 ## 版本敏感
 
-本插件的每个机制断言都取自 **AstrBot 4.26.7** 源码。升级 AstrBot 后请复核：
+本插件依赖 AstrBot 的若干内部契约，升级后请复核：
 
 * `on_llm_request` 是否仍在 `req.func_tool` 组装完成之后触发；
 * `_plugin_tool_fix` 是否仍在该钩子之前执行；
@@ -342,6 +347,25 @@ python tests/smoke_astrbot.py
   `/api/v1/plugins/extensions/<metadata.name>/<endpoint>`。
 
 `tests/smoke_astrbot.py` 就是为这件事写的——升级后先跑它。
+
+### 已核对过的版本
+
+| AstrBot | 核对方式 | 结果 |
+|---|---|---|
+| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与 4 个 Page 接口），148 项断言全绿 | 全部成立 |
+| **4.27.4** | 按上面五条逐条比对 tag `v4.27.4` 源码 | 全部成立 |
+
+4.27.4 的差异都落在本插件不依赖的地方：provider 选择改为 `get_using_provider_async`、
+TTS 查询改为 `get_using_tts_provider_async`、`_select_provider` 变成 `async`、
+新增群消息历史工具与 checkpoint 路径。`astrbot/core/star/register/star_handler.py`
+的**代码行与 4.26.7 完全一致**（仅一处中文 docstring 措辞变化），
+`astrbot/dashboard/services/plugin_page_service.py` 的**整文件哈希一致**。
+`provider_settings.tool_schema_mode` 的 `skills_like|full` 两个选项也仍在。
+
+> 未核对：**4.28.x**。4.28.0 把「Agent 执行器」配置从模型提供商页移进了配置文件页
+> （`#9821`），并提到工具 Schema 顺序按名字排序（`#9798`）——前者与本插件
+> 「仅 `agent_runner_type=local` 生效」的范围有关，升级到 4.28 前请先跑
+> `tests/smoke_astrbot.py` 并确认插件的日志就绪行仍出现。
 
 ---
 
