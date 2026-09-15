@@ -1,0 +1,74 @@
+{
+  "enabled": {
+    "description": "启用懒加载注入",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后本插件注册的工具会原样留在每轮请求里，与本插件未生效时行为一致（便于排查问题）"
+  },
+  "prefetch_enabled": {
+    "description": "启用预检索自动激活",
+    "type": "bool",
+    "default": true,
+    "hint": "每轮请求前用用户输入做本地关键词/标签检索，命中即自动激活。关闭后只能靠元工具手动搜索激活"
+  },
+  "top_k": {
+    "description": "每轮预检索最多自动激活的工具数",
+    "type": "int",
+    "default": 3,
+    "hint": "建议 2~5。数值越大越不容易漏工具，但也越接近全量注入"
+  },
+  "min_score": {
+    "description": "预检索自动激活的最低匹配分",
+    "type": "float",
+    "default": 0.35,
+    "hint": "取值 0~1，分数由关键词/标签覆盖率与命中强度加权得出。调低=更激进（易误激活），调高=更保守（易漏，靠元工具兜底）"
+  },
+  "default_ttl_turns": {
+    "description": "激活后的默认存活轮次",
+    "type": "int",
+    "default": 3,
+    "hint": "每轮开始递减 1，减到 0 自动失效。0 表示仅当前轮有效。多轮工具调用链需要它保持激活"
+  },
+  "default_ttl_seconds": {
+    "description": "激活后的默认存活秒数（0 表示不限）",
+    "type": "int",
+    "default": 600,
+    "hint": "与轮次过期是「或」关系：任一条先到即失效，避免用户挂机很久后工具仍然挂在那里"
+  },
+  "max_active_per_session": {
+    "description": "单会话同时激活上限",
+    "type": "int",
+    "default": 12,
+    "hint": "超出后按匹配分从低到高淘汰，防止激活表无限膨胀导致退化成全量注入"
+  },
+  "max_result_chars": {
+    "description": "工具返回结果最大字符数（0 表示不裁剪）",
+    "type": "int",
+    "default": 4000,
+    "hint": "统一包在工具外层裁剪，避免大 JSON 把上下文撑爆。工具自身用 max_result_chars 参数可覆盖此值"
+  },
+  "allow_high_risk_auto": {
+    "description": "允许预检索自动激活高风险工具",
+    "type": "bool",
+    "default": false,
+    "hint": "标记为 risk=\"high\" 的工具默认只能由模型通过元工具显式激活，不会被预检索自动唤醒"
+  },
+  "meta_tools_enabled": {
+    "description": "启用三个元工具",
+    "type": "bool",
+    "default": true,
+    "hint": "搜索 / 激活 / 取消激活。预检索未命中时模型可自行搜索激活。关闭后模型只能看到预检索命中的工具"
+  },
+  "sub_plugins_enabled": {
+    "description": "启用的子插件包",
+    "type": "list",
+    "default": [],
+    "hint": "填写 sub_plugins/ 下的子插件名；留空表示启用全部。子插件是被禁用的工具集，随时可通过 /lazy sub on|off <名字> 切换"
+  },
+  "debug": {
+    "description": "输出每轮注入明细日志",
+    "type": "bool",
+    "default": false,
+    "hint": "会记录候选工具的匹配分与被裁剪的工具名，排查「工具没被激活」时打开"
+  }
+}

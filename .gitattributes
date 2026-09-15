@@ -1,0 +1,7 @@
+# 统一行尾，避免不同平台 clone 后整文件被标记为改动
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
