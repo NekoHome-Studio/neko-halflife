@@ -1,14 +1,14 @@
 {
   "metadata": {
-    "display_name": "Lazy Tool Injection",
+    "display_name": "Neko Half-Life · Schrödinger's Toolbox",
     "short_desc": "Register every tool, inject the manual on demand",
-    "desc": "All tools are still registered with AstrBot, so upstream permissions (persona tool allow-lists, per-session plugin filtering, per-tool enable switches) keep applying. Before each request the plugin runs a local retrieval over the user's message and hands the model only the full schemas of the tools activated for that turn. It saves prompt budget and context window, not tool execution compute."
+    "desc": "Named after Schrödinger's cat: a tool is both registered (it exists) and absent from the current request (invisible), and only collapses into a full schema the model can see once local retrieval \"observes\" and activates it. All tools are still registered with AstrBot, so upstream permissions (persona tool allow-lists, per-session plugin filtering, per-tool enable switches) keep applying. Before each request the plugin runs a local retrieval over the user's message and hands the model only the full schemas of the tools activated for that turn. It saves prompt budget and context window, not tool execution compute."
   },
   "pages": {
     "lazy-tools": {
-      "title": "Lazy Tools",
+      "title": "Schrödinger's Toolbox",
       "description": "Inspect the tool registry and per-session activation state, and dry-run retrieval to calibrate thresholds",
-      "heading": "Lazy Tools",
+      "heading": "Schrödinger's Toolbox",
       "subheading": "Tools stay registered; manuals are injected on demand. Inspect the registry, per-session activation, and dry-run retrieval here.",
       "refresh": "Refresh",
       "playground": "Retrieval dry-run",

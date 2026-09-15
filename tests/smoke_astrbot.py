@@ -421,6 +421,31 @@ def main() -> int:
         check(bool(page_i18n.get("title")), f"{locale} 提供 pages.lazy-tools.title")
         check(bool(page_i18n.get("description")), f"{locale} 提供 pages.lazy-tools.description")
 
+    print()
+    print("12. metadata 与代码常量一致（改名时最容易漏的地方）")
+    import yaml
+
+    meta = yaml.safe_load((PLUGIN_ROOT / "metadata.yaml").read_text(encoding="utf-8"))
+    check(
+        meta.get("name") == plugin_main.PLUGIN_NAME,
+        f"metadata.name 与 PLUGIN_NAME 一致：{meta.get('name')}",
+    )
+    check(
+        isinstance(meta.get("name"), str) and meta["name"].isidentifier(),
+        "metadata.name 是合法 Python 标识符（AstrBot 硬性要求，连字符会拒绝加载）",
+    )
+    for field in ("name", "desc", "version", "author"):
+        value = meta.get(field)
+        check(
+            isinstance(value, str) and bool(value.strip()),
+            f"metadata.{field} 是非空字符串（AstrBot 必需字段）",
+        )
+    check(bool(meta.get("display_name")), "metadata.display_name 已设置")
+    check(
+        str(meta.get("astrbot_version", "")).strip() != "",
+        "metadata.astrbot_version 已声明",
+    )
+
     total = _PASSED + len(_FAILED)
     print()
     print(f"通过 {_PASSED}/{total}")

@@ -24,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover
     from core.models import ToolMeta
 
-logger = logging.getLogger("astrbot_plugin_lazy_tools")
+logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 #: 各字段的权重。改动这里会同时影响覆盖率与强度两项。
 FIELD_WEIGHTS: dict[str, float] = {

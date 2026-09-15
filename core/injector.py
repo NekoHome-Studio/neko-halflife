@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-logger = logging.getLogger("astrbot_plugin_lazy_tools")
+logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 
 def _new_toolset() -> Any | None:

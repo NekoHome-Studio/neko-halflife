@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-logger = logging.getLogger("astrbot_plugin_lazy_tools")
+logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 
 @dataclass

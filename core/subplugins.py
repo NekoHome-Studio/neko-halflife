@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     from core.registry import REGISTRY, ToolRegistry, lazy_tool, pop_source, push_source
 
-logger = logging.getLogger("astrbot_plugin_lazy_tools")
+logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 #: 子插件目录名，相对插件根目录。
 SUBDIR_NAME = "sub_plugins"
@@ -41,12 +41,12 @@ SUBDIR_NAME = "sub_plugins"
 def _package_prefix() -> str:
     """推导本插件包的完整模块名，用于给子插件模块起名。
 
-    例：``data.plugins.astrbot_plugin_lazy_tools.core`` -> ``data.plugins.astrbot_plugin_lazy_tools``
+    例：``data.plugins.astrbot_plugin_neko_halflife.core`` -> ``data.plugins.astrbot_plugin_neko_halflife``
     """
     pkg = __package__ or ""
     if "." in pkg:
         return pkg.rsplit(".", 1)[0]
-    return pkg or "astrbot_plugin_lazy_tools"
+    return pkg or "astrbot_plugin_neko_halflife"
 
 
 class SubPluginLoader:

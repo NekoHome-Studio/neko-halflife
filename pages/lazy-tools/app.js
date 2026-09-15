@@ -143,8 +143,8 @@ async function callPost(endpoint, body) {
 /* ------------------------------------------------------------------ */
 
 function applyLabels() {
-  document.title = t("pages.lazy-tools.title", "懒加载工具");
-  dom.heading.textContent = t("pages.lazy-tools.heading", "懒加载工具");
+  document.title = t("pages.lazy-tools.title", "薛定谔的工具箱");
+  dom.heading.textContent = t("pages.lazy-tools.heading", "薛定谔的工具箱");
   dom.subheading.textContent = t(
     "pages.lazy-tools.subheading",
     "工具照常注册，说明书按需注入——这里可以看到注册表、逐会话激活状态，并在线试跑检索。",

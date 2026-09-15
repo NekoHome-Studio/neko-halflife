@@ -1,7 +1,9 @@
-name: astrbot_plugin_lazy_tools
-display_name: 懒加载工具注入
+name: astrbot_plugin_neko_halflife
+display_name: 薛定谔的工具箱 · Neko Half-Life
 short_desc: 工具照常注册，说明书按需注入——只把激活工具的完整 Schema 交给模型
 desc: >-
+  名字取自薛定谔的猫：工具既已经注册（存在），又没有进入本轮请求（不可见），
+  只有在被本地检索「观测」到并激活之后，才坍缩成模型能看见的一整套 Schema。
   常规情况下 AstrBot 会把所有已注册工具的完整 JSON Schema 一次性放进每轮 LLM 请求，
   工具越多、描述越长，提示词开销越大。本插件采用「全量注册、按需注入」：
   所有工具照常注册进 AstrBot（因此 persona、会话插件过滤、工具启用开关等上游权限依然生效），

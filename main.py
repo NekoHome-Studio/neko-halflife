@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
-"""astrbot_plugin_lazy_tools —— 工具说明书按需注入
+"""astrbot_plugin_neko_halflife —— 薛定谔的工具箱
 =================================================
+
+名字取自薛定谔的猫：工具既已经注册（存在），又没有进入本轮请求（不可见），
+只有在被本地检索「观测」到并激活之后，才坍缩成模型能看见的一整套 Schema。
 
 常规情况下，AstrBot 会把**所有**已注册工具的完整 JSON Schema 一次性放进每轮 LLM
 请求里；工具越多、描述越长、会话越长，消耗的提示词 token 就越多。本插件把这件事
@@ -58,7 +61,7 @@ __all__ = ["LazyToolsPlugin", "lazy_tool"]
 #: （PluginPagePage.vue 的 buildPluginApiPath）拼的就是
 #: ``/api/v1/plugins/extensions/<plugin.name>/<endpoint>``，
 #: 而页面里 ``bridge.apiGet("state")`` 不带这个前缀。
-PLUGIN_NAME = "astrbot_plugin_lazy_tools"
+PLUGIN_NAME = "astrbot_plugin_neko_halflife"
 
 #: 会话快照的保留时长与数量上限，避免长时间运行后字典无限增长。
 _TURN_TTL_SECONDS = 3600.0
@@ -66,7 +69,7 @@ _TURN_MAX_ENTRIES = 512
 
 
 class LazyToolsPlugin(Star):
-    """懒加载工具注入插件。"""
+    """薛定谔的工具箱：懒加载工具注入插件。"""
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -703,7 +706,7 @@ class LazyToolsPlugin(Star):
         pool = self._lazy_pool(umo)
         candidates = REGISTRY.candidates()
         lines = [
-            "【懒加载工具注入】",
+            "【薛定谔的工具箱】",
             f"状态：{'启用' if self._enabled else '已关闭（工具原样注入）'}",
             f"工具：注册 {len(candidates)} 个，本会话许可 {len(pool)} 个",
             f"预检索：{'开' if self._prefetch_enabled else '关'}，"

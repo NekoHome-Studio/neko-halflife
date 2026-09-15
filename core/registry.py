@@ -25,7 +25,7 @@ try:  # 允许在没有 AstrBot 的环境里单独导入本模块做纯逻辑测
 except ImportError:  # pragma: no cover - AstrBot 直接以模块方式载入 main.py 时
     from core.models import RISK_NORMAL, ToolMeta
 
-logger = logging.getLogger("astrbot_plugin_lazy_tools")
+logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 #: 结果裁剪的全局默认值。装饰器在导入期执行，那时还读不到插件配置，
 #: 因此这里放一个可变槽位，由插件 ``__init__`` 从配置写入。

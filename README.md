@@ -1,9 +1,13 @@
-# astrbot_plugin_lazy_tools —— 工具说明书按需注入
+# 薛定谔的工具箱 · Neko Half-Life
 
-> 仓库：`Nekohome-cc/neko-halflife` · AstrBot 插件（`metadata.name = astrbot_plugin_lazy_tools`）
+> 仓库：`Nekohome-cc/neko-halflife` · AstrBot 插件（`metadata.name = astrbot_plugin_neko_halflife`）
 >
 > 工具照常注册，说明书按需注入；本地检索先激活，再把 Schema 给模型看。
 > 省的是提示词预算与上下文窗口，**不省工具执行算力**。
+
+**名字的由来**：一个工具既已经注册（存在），又没有进入本轮请求（不可见），
+只有在被本地检索「观测」到并激活之后，才坍缩成模型能看见的一整套 Schema——
+就是薛定谔的猫（`neko` 是猫，`half-life` 是它待的那口箱子）。
 
 AstrBot 默认会把**所有**已注册工具的完整 JSON Schema 一次性放进每轮 LLM 请求。
 工具越多、描述越长、会话越长，提示词开销越大。本插件把这件事拆成两半：
@@ -53,14 +57,14 @@ AstrBot 4.26.7 自带 `provider_settings.tool_schema_mode = skills_like | full`
 https://github.com/Nekohome-cc/neko-halflife
 ```
 
-AstrBot 会按 `metadata.name` 把目录重命名为 `astrbot_plugin_lazy_tools`，
+AstrBot 会按 `metadata.name` 把目录重命名为 `astrbot_plugin_neko_halflife`，
 所以仓库叫什么名字不影响安装结果。
 
 **B. 手动 clone**
 
 ```
 cd <AstrBot>/data/plugins
-git clone https://github.com/Nekohome-cc/neko-halflife astrbot_plugin_lazy_tools
+git clone https://github.com/Nekohome-cc/neko-halflife astrbot_plugin_neko_halflife
 ```
 
 装好后在 WebUI 插件管理里重载即可。无第三方依赖，不需要 `requirements.txt`。
