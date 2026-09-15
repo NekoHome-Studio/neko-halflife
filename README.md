@@ -73,6 +73,29 @@ git clone https://github.com/NekoHome-Studio/neko-halflife astrbot_plugin_neko_h
 组装完成之后触发，且依赖 `_plugin_tool_fix`（会话级插件过滤）在该钩子**之前**执行，
 这两点是在 4.26.7 源码上逐行核对过的。
 
+### 更新已安装的插件
+
+`metadata.yaml` 里声明了 `repo`，所以 WebUI 插件列表里的**「更新」可以直接用**——
+AstrBot 的更新流程是「下载 → 校验 → 删除旧目录 → 解包」，不会留下残留文件。
+
+**不要用「从文件安装」去更新**。AstrBot 的 `install_plugin_from_file` 在目标目录
+已存在时会硬失败：
+
+```
+安装失败：目录 astrbot_plugin_neko_halflife 已存在。
+```
+
+它没有覆盖/强制选项（`ignore_version_check` 管的是版本约束，不是文件覆盖）。
+要更新只能二选一：走「更新」，或者先删掉 `data/plugins/astrbot_plugin_neko_halflife/`
+再上传安装包。
+
+手动替换也可以（解包后重载插件）：
+
+```bash
+cd <AstrBot>/data/plugins/astrbot_plugin_neko_halflife
+unzip -o /path/to/astrbot_plugin_neko_halflife-<版本>.zip
+```
+
 ---
 
 ## 怎么用

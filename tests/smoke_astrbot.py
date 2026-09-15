@@ -444,6 +444,13 @@ def main() -> int:
             f"metadata.{field} 是非空字符串（AstrBot 必需字段）",
         )
     check(bool(meta.get("display_name")), "metadata.display_name 已设置")
+    # 没有 repo 字段时，AstrBot 的「更新」会直接报「未指定仓库地址或下载地址」，
+    # 而「从文件安装」在目录已存在时又硬失败（install_plugin_from_file 无覆盖选项），
+    # 结果是插件永远只能手工替换文件。这个字段是就地更新的前提。
+    check(
+        bool(meta.get("repo")),
+        f"metadata.repo 已声明（就地更新的前提）：{meta.get('repo')}",
+    )
     check(
         str(meta.get("astrbot_version", "")).strip() != "",
         "metadata.astrbot_version 已声明",
