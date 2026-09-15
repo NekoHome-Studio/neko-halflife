@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "display_name": "Lazy Tool Injection",
+    "short_desc": "Register every tool, inject the manual on demand",
+    "desc": "All tools are still registered with AstrBot, so upstream permissions (persona tool allow-lists, per-session plugin filtering, per-tool enable switches) keep applying. Before each request the plugin runs a local retrieval over the user's message and hands the model only the full schemas of the tools activated for that turn. It saves prompt budget and context window, not tool execution compute."
+  },
+  "pages": {
+    "lazy-tools": {
+      "title": "Lazy Tools",
+      "description": "Inspect the tool registry and per-session activation state, and dry-run retrieval to calibrate thresholds",
+      "heading": "Lazy Tools",
+      "subheading": "Tools stay registered; manuals are injected on demand. Inspect the registry, per-session activation, and dry-run retrieval here.",
+      "refresh": "Refresh",
+      "playground": "Retrieval dry-run",
+      "playground_hint": "read-only, does not touch the activation table",
+      "query_placeholder": "Type what a user might say, e.g. echo this sentence back to me",
+      "top_k": "top_k",
+      "threshold": "Threshold",
+      "run": "Run",
+      "tools": "Tool registry",
+      "col_name": "Tool",
+      "col_source": "Source",
+      "col_tags": "Tags",
+      "col_ttl": "TTL",
+      "col_risk": "Risk",
+      "col_desc": "Description",
+      "sources": "Sub-plugins",
+      "sources_hint": "When disabled, a sub-plugin's tools stop being retrieved and injected; the state is written back to the plugin config",
+      "sessions": "Session activation table",
+      "card_tools": "Registered tools",
+      "card_meta": "Always-on meta tools",
+      "card_index": "Indexed entries",
+      "card_sessions": "Active sessions",
+      "card_active": "Currently active",
+      "card_policy": "Expiry policy",
+      "disabled": "Disabled (tools injected as-is)",
+      "manual": "Enabled · meta tools only",
+      "running": "Enabled",
+      "loading": "Syncing…",
+      "synced": "In sync",
+      "failed": "Load failed"
+    }
+  }
+}

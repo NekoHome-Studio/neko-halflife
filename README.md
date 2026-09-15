@@ -148,6 +148,31 @@ sub_plugins/
 /lazy_sub on|off <名>  管理员启停子插件
 ```
 
+### 5. WebUI 面板（Pages）
+
+插件在 AstrBot WebUI 的插件详情页里提供一个 **懒加载工具** 面板
+（`pages/lazy-tools/`），能做四件事：
+
+* **状态总览**：注册工具数、常驻元工具数、索引条目、活跃会话、当前激活总数、过期策略；
+* **检索试跑**（最实用的一块）：输入一句用户可能会说的话，直接看到召回候选、
+  每一项的分数、是否过阈值、是否会被本轮激活，以及**被排除的原因**
+  （低于阈值 / 被上游 persona 或插件过滤排除 / 超出 `top_k` / 高风险需手动激活）。
+  它会额外回显「信息词」——如果这一列是空的，说明这句话的词和任何工具的
+  名字/标签/描述/示例都没有交集，**此时调阈值没有任何用**，该做的是给工具补
+  `tags` 或 `examples`。这是校准 `min_score`/`top_k` 最省事的方式，
+  比改配置→发消息→翻日志快得多；
+* **工具清单**：名称、来源（`main` 还是某个子插件）、标签、存活策略、风险等级、描述；
+* **会话激活表**：按 UMO 列出每个会话当前激活了哪些工具、还剩几轮/几秒，可单独清空；
+* **子插件开关**：在线启停 `sub_plugins/` 下的工具集，状态会写回插件配置。
+
+页面通过 `window.AstrBotPluginPage` bridge 与 WebUI 外壳通信，主题跟随 WebUI
+的明暗切换，文案走 `.astrbot-plugin/i18n/`（zh-CN / en-US）。
+
+> Page 跑在 `allow-scripts` 但没有 `allow-same-origin` 的 iframe 里，
+> 因此不能 fetch、不能用 localStorage、拿不到 dashboard cookie——所有请求都必须
+> 走 bridge。新增接口时记得后端路由要带插件名前缀
+> （`/{PLUGIN_NAME}/xxx`），而页面里 `bridge.apiGet("xxx")` **不带**前缀。
+
 ---
 
 ## 配置项
@@ -165,10 +190,14 @@ sub_plugins/
 | `max_active_per_session` | 12 | 单会话上限，超出按分淘汰 |
 | `max_result_chars` | 4000 | 工具结果统一裁剪长度 |
 | `allow_high_risk_auto` | false | 是否允许预检索自动激活 `risk="high"` 工具 |
-| `sub_plugins_enabled` | `[]` | 启用的子插件，空 = 全部 |
+| `sub_plugins_disabled` | `[]` | **停用**的子插件，空 = 全部启用 |
+
+> `sub_plugins_disabled` 存的是停用名单而不是启用名单：启用名单里的空列表无法
+> 区分「一个都不启用」和「留空 = 全部启用」，会把「全停」静默变成「全开」。
 
 **调参直觉**：漏工具就把 `min_score` 调低或 `top_k` 调大（元工具仍能兜底）；
-误激活太多就反过来调，并缩短 `default_ttl_turns`。
+误激活太多就反过来调，并缩短 `default_ttl_turns`。拿不准时先用 Pages 里的
+「检索试跑」看一眼真实分数，别盲调。
 
 ---
 
@@ -258,14 +287,19 @@ req.func_tool = 许可池中 (非本插件工具 ∪ keep)
 # 1) 纯逻辑自检：检索打分、双过期、裁剪安全性（无依赖，49 项）
 python tests/selftest.py
 
-# 2) 集成冒烟：在真实 AstrBot 源码环境里验证注册契约（31 项）
-#    需要能 import astrbot；用 ASTRBOT_ROOT 指定源码根目录
+# 2) 集成冒烟：在真实 AstrBot 源码环境里验证注册契约与 Web API（87 项）
+#    需要能 import astrbot；用 ASTRBOT_SRC 指定源码根目录
+#    （刻意不用 ASTRBOT_ROOT——那是 AstrBot 自己的运行根目录变量）
 python tests/smoke_astrbot.py
 ```
 
 `tests/selftest.py` 里最重要的是 `test_pruning_never_exceeds_pool`：
 它构造「激活表里有两个工具、许可池里只有一个」的场景，
 断言最终请求里绝不会出现许可池之外的工具。
+
+`tests/smoke_astrbot.py` 会真的导入 AstrBot、真的构造 `ToolSet` 与 `FunctionTool`、
+真的跑一遍 `_decide()` 和四个 Page 接口，并校验 Page 目录与 i18n 文件齐备。
+它把 AstrBot 的 `data/` 重定向到插件目录内的临时目录（已 gitignore），跑完自动删除。
 
 ---
 
@@ -276,6 +310,8 @@ python tests/smoke_astrbot.py
 * `on_llm_request` 是否仍在 `req.func_tool` 组装完成之后触发；
 * `_plugin_tool_fix` 是否仍在该钩子之前执行；
 * `ToolSet` 的 `tools` / `add_tool` / `remove_tool` 接口；
-* `filter.llm_tool` 是否仍从 docstring 的 `Args:` 段解析参数。
+* `filter.llm_tool` 是否仍从 docstring 的 `Args:` 段解析参数；
+* Page 是否仍只扫 `pages/<name>/index.html`，以及前端拼路由是否仍是
+  `/api/v1/plugins/extensions/<metadata.name>/<endpoint>`。
 
 `tests/smoke_astrbot.py` 就是为这件事写的——升级后先跑它。

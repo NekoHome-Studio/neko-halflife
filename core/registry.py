@@ -111,13 +111,18 @@ class ToolRegistry:
     # ---- 写入 ----------------------------------------------------------
 
     def register(self, meta: ToolMeta) -> None:
-        if meta.name in self._tools:
-            logger.warning(
-                "[lazy-tools] 工具名重复，后者覆盖前者：%s（%s -> %s）",
-                meta.name,
-                self._tools[meta.name].module,
-                meta.module,
-            )
+        previous = self._tools.get(meta.name)
+        if previous is not None:
+            if previous.module == meta.module:
+                # 同一个模块被重新导入（插件重载、子插件启停）——覆盖即可，不算冲突。
+                logger.debug("[lazy-tools] 重载工具元数据：%s", meta.name)
+            else:
+                logger.warning(
+                    "[lazy-tools] 工具名冲突，%s 覆盖了 %s 的同名工具：%s",
+                    meta.module,
+                    previous.module,
+                    meta.name,
+                )
         self._tools[meta.name] = meta
 
     def set_source_enabled(self, source: str, enabled: bool) -> None:

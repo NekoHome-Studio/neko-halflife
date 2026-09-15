@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import importlib
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -296,6 +297,129 @@ def main() -> int:
         set(request3.func_tool.names()) == set(all_names),
         "关闭后工具集原样保留（便于对比排查）",
     )
+
+    print()
+    print("10. Web UI 后端接口")
+    plugin._apply_config({"enabled": True, "prefetch_enabled": True, "min_score": 0.35})
+
+    registered: list[tuple[str, list[str]]] = []
+
+    class FakeContext:
+        def register_web_api(self, route, handler, methods, description):
+            registered.append((route, list(methods)))
+
+    plugin.context = FakeContext()
+    plugin._register_web_apis()
+
+    routes = dict(registered)
+    for suffix, method in (
+        ("state", "GET"),
+        ("search", "POST"),
+        ("sessions/clear", "POST"),
+        ("sources/toggle", "POST"),
+    ):
+        route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+        check(route in routes, f"注册了路由 {route}")
+        check(routes.get(route) == [method], f"{suffix} 的方法为 {method}")
+    check(
+        all(r.startswith(f"/{plugin_main.PLUGIN_NAME}/") for r, _ in registered),
+        "所有路由都带插件名前缀（前端 endpoint 不带，由 dashboard 拼接）",
+    )
+
+    class FakeWebRequest:
+        def __init__(self, payload=None):
+            self.payload = payload or {}
+
+        async def json(self, default=None):
+            return self.payload
+
+    def body_of(response) -> dict:
+        return json.loads(bytes(response.body).decode("utf-8"))
+
+    state_payload = body_of(asyncio.run(plugin.page_state()))
+    check(state_payload.get("plugin_name") == plugin_main.PLUGIN_NAME, "state 返回插件名")
+    check(
+        state_payload["stats"]["tools"] >= 3,
+        f"state 统计到 {state_payload['stats']['tools']} 个候选工具",
+    )
+    tool_names = {tool["name"] for tool in state_payload["tools"]}
+    check("lazy_search_tools" in tool_names, "state 覆盖常驻元工具")
+    check("demo_echo" in tool_names, "state 覆盖子插件工具")
+    source_names = {item["name"] for item in state_payload["sources"]}
+    check("demo_tools" in source_names, "state 列出子插件来源")
+
+    # 先造一个会话激活，再验证 state / clear 能看到它
+    plugin_main.request = FakeWebRequest({})
+    request4, event4 = make_request("帮我把这句话回显一下", all_names)
+    plugin._decide(event4, request4)
+    state_payload = body_of(asyncio.run(plugin.page_state()))
+    check(state_payload["stats"]["sessions"] >= 1, "state 能看到活跃会话")
+
+    plugin_main.request = FakeWebRequest({"query": "帮我把这句话回显一下"})
+    search_payload = body_of(asyncio.run(plugin.page_search()))
+    hit_names = [hit["name"] for hit in search_payload["hits"]]
+    check("demo_echo" in hit_names, f"search 召回 demo_echo：{hit_names[:3]}")
+    check(bool(search_payload["info_tokens"]), "search 返回信息词，便于排查漏召回")
+    echo_hit = next(h for h in search_payload["hits"] if h["name"] == "demo_echo")
+    check(echo_hit["would_activate"], "试跑确认该工具本轮会被激活")
+
+    plugin_main.request = FakeWebRequest({"query": "量子纠缠退相干"})
+    empty_payload = body_of(asyncio.run(plugin.page_search()))
+    check(empty_payload["info_tokens"] == [], "无交集查询的信息词为空（提示用户该补 tags）")
+    check(empty_payload["hits"] == [], "无交集查询不召回任何工具")
+
+    plugin_main.request = FakeWebRequest({"query": ""})
+    bad = asyncio.run(plugin.page_search())
+    check(bad.status_code == 400, "空 query 返回 400")
+
+    plugin_main.request = FakeWebRequest({"umo": event4.unified_msg_origin})
+    cleared = body_of(asyncio.run(plugin.page_clear_session()))
+    check(cleared["cleared"] >= 1, f"清空会话生效：{cleared}")
+    check(plugin.activation.names(event4.unified_msg_origin) == (), "清空后激活表为空")
+
+    plugin_main.request = FakeWebRequest({"name": "demo_tools", "enabled": False})
+    toggled = body_of(asyncio.run(plugin.page_toggle_source()))
+    check(toggled["enabled"] is False, "子插件可停用")
+    check(not REGISTRY.is_source_enabled("demo_tools"), "注册表来源已停用")
+    check(
+        all(meta.source != "demo_tools" for meta in REGISTRY.candidates()),
+        "停用后其工具退出检索候选",
+    )
+    check(
+        plugin._sub_disabled == ["demo_tools"],
+        f"停用写入停用名单（而非空名单）：{plugin._sub_disabled}",
+    )
+
+    plugin_main.request = FakeWebRequest({"name": "demo_tools", "enabled": True})
+    toggled = body_of(asyncio.run(plugin.page_toggle_source()))
+    check(toggled["enabled"] is True, "子插件可重新启用")
+    check(REGISTRY.is_source_enabled("demo_tools"), "重新启用后来源可用")
+
+    plugin_main.request = FakeWebRequest({"name": "not_exist", "enabled": True})
+    missing = asyncio.run(plugin.page_toggle_source())
+    check(missing.status_code == 404, "未知子插件返回 404")
+
+    print()
+    print("11. Page 与 i18n 文件齐备")
+    page_dir = PLUGIN_ROOT / "pages" / "lazy-tools"
+    check((page_dir / "index.html").is_file(), "pages/lazy-tools/index.html 存在（强制入口文件名）")
+    check((page_dir / "app.js").is_file(), "app.js 存在")
+    check((page_dir / "style.css").is_file(), "style.css 存在")
+    check(
+        not (page_dir / "index.html").read_text(encoding="utf-8").count("http://"),
+        "index.html 不引用绝对 http 资源（iframe 无 same-origin，必须相对路径）",
+    )
+    html = (page_dir / "index.html").read_text(encoding="utf-8")
+    check('type="module"' in html, "脚本以 module 方式加载（保证 bridge 先就位）")
+    check("./app.js" in html and "./style.css" in html, "资源使用相对路径引用")
+
+    for locale in ("zh-CN", "en-US"):
+        i18n_path = PLUGIN_ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
+        check(i18n_path.is_file(), f"i18n/{locale}.json 存在")
+        data = json.loads(i18n_path.read_text(encoding="utf-8"))
+        page_i18n = data.get("pages", {}).get("lazy-tools", {})
+        check(bool(page_i18n.get("title")), f"{locale} 提供 pages.lazy-tools.title")
+        check(bool(page_i18n.get("description")), f"{locale} 提供 pages.lazy-tools.description")
 
     total = _PASSED + len(_FAILED)
     print()

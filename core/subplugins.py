@@ -124,24 +124,26 @@ class SubPluginLoader:
         logger.info("[lazy-tools] 子插件 %s 已加载（%s）", name, path.name)
         return True
 
-    def load_all(self, only: Iterable[str] | None = None) -> dict[str, bool]:
-        """加载全部（或指定）子插件，并同步启用状态。
+    def load_all(self, disabled: Iterable[str] | None = None) -> dict[str, bool]:
+        """加载全部子插件，并按停用名单设置启用状态。
 
         Args:
-            only: ``sub_plugins_enabled`` 配置；空表示全部启用。
+            disabled: 需要停用的子插件名；留空表示全部启用。
+
+        这里刻意用**停用名单**而不是启用名单：启用名单无法区分「一个都不启用」
+        和「留空 = 全部启用」——两者都是空列表，会把「全停」静默变成「全开」。
 
         Returns:
             ``name -> 是否加载成功``。
         """
-        wanted = {str(n).strip() for n in (only or ()) if str(n).strip()}
+        off = {str(n).strip() for n in (disabled or ()) if str(n).strip()}
         result: dict[str, bool] = {}
         for name in self.discover():
             ok = self.load(name)
             result[name] = ok
             if not ok:
                 continue
-            enabled = (not wanted) or (name in wanted)
-            self.registry.set_source_enabled(name, enabled)
+            self.registry.set_source_enabled(name, name not in off)
         # 注册表里存在但目录已消失的子插件：直接清掉，避免残留不可见工具。
         for stale in self.registry.sources():
             if stale not in result:

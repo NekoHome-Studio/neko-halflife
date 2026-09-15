@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "display_name": "懒加载工具注入",
+    "short_desc": "工具照常注册，说明书按需注入",
+    "desc": "所有工具照常注册进 AstrBot（上游的 persona 白名单、会话插件过滤、工具启用开关依然生效），但在每轮请求发出前按用户输入做本地检索，只把已激活工具的完整 Schema 交给模型。省的是提示词预算与上下文窗口，不省工具执行算力。"
+  },
+  "pages": {
+    "lazy-tools": {
+      "title": "懒加载工具",
+      "description": "查看工具注册表与逐会话激活状态，并在线试跑检索以校准阈值",
+      "heading": "懒加载工具",
+      "subheading": "工具照常注册，说明书按需注入——这里可以看到注册表、逐会话激活状态，并在线试跑检索。",
+      "refresh": "刷新",
+      "playground": "检索试跑",
+      "playground_hint": "只读，不会改动激活表",
+      "query_placeholder": "输入一句用户可能会说的话，例如：帮我把这句话回显一下",
+      "top_k": "top_k",
+      "threshold": "阈值",
+      "run": "试跑",
+      "tools": "工具清单",
+      "col_name": "工具名",
+      "col_source": "来源",
+      "col_tags": "标签",
+      "col_ttl": "存活",
+      "col_risk": "风险",
+      "col_desc": "描述",
+      "sources": "子插件",
+      "sources_hint": "停用后其工具不再参与检索，也不会注入；状态会写回插件配置",
+      "sessions": "会话激活表",
+      "card_tools": "注册工具",
+      "card_meta": "常驻元工具",
+      "card_index": "索引条目",
+      "card_sessions": "活跃会话",
+      "card_active": "当前激活",
+      "card_policy": "过期策略",
+      "disabled": "已关闭（工具原样注入）",
+      "manual": "启用中 · 仅元工具",
+      "running": "启用中",
+      "loading": "同步中…",
+      "synced": "已同步",
+      "failed": "读取失败"
+    }
+  }
+}

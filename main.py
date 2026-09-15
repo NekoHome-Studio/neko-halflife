@@ -35,6 +35,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.api.web import error_response, json_response, request
 
 try:
     from .core import injector
@@ -53,6 +54,12 @@ except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
 
 __all__ = ["LazyToolsPlugin", "lazy_tool"]
 
+#: Page 用的后端路由前缀。必须是 metadata.name——dashboard 前端
+#: （PluginPagePage.vue 的 buildPluginApiPath）拼的就是
+#: ``/api/v1/plugins/extensions/<plugin.name>/<endpoint>``，
+#: 而页面里 ``bridge.apiGet("state")`` 不带这个前缀。
+PLUGIN_NAME = "astrbot_plugin_lazy_tools"
+
 #: 会话快照的保留时长与数量上限，避免长时间运行后字典无限增长。
 _TURN_TTL_SECONDS = 3600.0
 _TURN_MAX_ENTRIES = 512
@@ -69,6 +76,7 @@ class LazyToolsPlugin(Star):
         self.loader = SubPluginLoader(Path(__file__).resolve().parent, REGISTRY)
         self._turns: dict[str, TurnContext] = {}
         self._apply_config(config)
+        self._register_web_apis()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -369,8 +377,210 @@ class LazyToolsPlugin(Star):
         self.loader.set_enabled(name, action == "on")
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
+        self._persist_sub_plugins()
         state = "已启用" if action == "on" else "已停用"
         yield event.plain_result(f"子插件 {name} {state}，索引已重建（{self.index.size} 条）。")
+
+    # ------------------------------------------------------------------
+    # Web UI 后端接口（对应 pages/lazy-tools/）
+    # ------------------------------------------------------------------
+
+    def _register_web_apis(self) -> None:
+        """注册 Page 用的后端接口。
+
+        路由必须带插件名前缀；页面里 ``bridge.apiGet("state")`` 不带前缀，
+        由 dashboard 拼成 ``/api/v1/plugins/extensions/<插件名>/state``。
+        同路由同方法重复注册会被 ``Context.register_web_api`` 静默替换，
+        所以插件重载是幂等的。
+        """
+        routes = (
+            ("state", self.page_state, ["GET"], "懒加载工具总览"),
+            ("search", self.page_search, ["POST"], "试跑本地检索"),
+            ("sessions/clear", self.page_clear_session, ["POST"], "清空指定会话的激活表"),
+            ("sources/toggle", self.page_toggle_source, ["POST"], "启用或停用子插件"),
+        )
+        for suffix, handler, methods, description in routes:
+            try:
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/{suffix}", handler, methods, description
+                )
+            except Exception as exc:  # noqa: BLE001 - 注册失败不该拖垮插件加载
+                logger.error("[lazy-tools] 注册 Web API %s 失败：%s", suffix, exc)
+
+    async def page_state(self):
+        """总览：配置、统计、工具清单、子插件与各会话激活表。"""
+        sessions = self.activation.describe()
+
+        counts: dict[str, int] = {}
+        for meta in REGISTRY.all():
+            if meta.source != "main":
+                counts[meta.source] = counts.get(meta.source, 0) + 1
+        sources = [
+            {
+                "name": name,
+                "enabled": REGISTRY.is_source_enabled(name),
+                "tools": counts.get(name, 0),
+                "loaded": name in self.loader.loaded,
+                "error": self.loader.errors.get(name),
+            }
+            for name in sorted(set(counts) | set(self.loader.discover()))
+        ]
+
+        tools = [
+            {
+                "name": meta.name,
+                "description": meta.description,
+                "source": meta.source,
+                "group": meta.group,
+                "tags": list(meta.tags),
+                "examples": list(meta.examples),
+                "risk": meta.risk,
+                "always_active": meta.always_active,
+                "ttl_turns": self._ttl_turns(meta),
+                "ttl_seconds": self._ttl_seconds(meta),
+                "max_result_chars": meta.max_result_chars or RESULT_LIMITS.get("default"),
+                "enabled": meta.source == "main"
+                or REGISTRY.is_source_enabled(meta.source),
+            }
+            for meta in sorted(REGISTRY.all(), key=lambda m: (m.source, m.name))
+        ]
+
+        return json_response(
+            {
+                "plugin_name": PLUGIN_NAME,
+                "enabled": self._enabled,
+                "stats": {
+                    "tools": len(REGISTRY.candidates()),
+                    "meta_tools": len(REGISTRY.always_active()),
+                    "all_tools": len(REGISTRY.all()),
+                    "indexed": self.index.size,
+                    "sessions": len(sessions),
+                    "activations": sum(item["count"] for item in sessions),
+                    "turn_snapshots": len(self._turns),
+                },
+                "config": {
+                    "prefetch_enabled": self._prefetch_enabled,
+                    "top_k": self._top_k,
+                    "min_score": round(self._min_score, 3),
+                    "default_ttl_turns": self._default_ttl_turns,
+                    "default_ttl_seconds": self._default_ttl_seconds,
+                    "max_active_per_session": self._max_active,
+                    "max_result_chars": RESULT_LIMITS.get("default"),
+                    "allow_high_risk_auto": self._allow_high_risk,
+                    "meta_tools_enabled": self._meta_enabled,
+                    "debug": self._debug,
+                },
+                "tools": tools,
+                "sources": sources,
+                "sessions": sessions,
+            }
+        )
+
+    async def page_search(self):
+        """在线试跑检索。
+
+        只读：**不改动激活表**，只回答「这句话会召回什么、够不够阈值」。
+        这是调 ``min_score`` / ``top_k`` 时最省事的工具——比改配置、发消息、
+        翻日志快得多。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return error_response("请提供 query。")
+
+        top_k = self._clamp_int(payload.get("top_k"), default=self._search_top_k, low=1, high=50)
+        min_score = self._clamp_float(
+            payload.get("min_score"), default=self._min_score, low=0.0, high=1.0
+        )
+        umo = str(payload.get("umo") or "").strip()
+        allowed = self._lazy_pool(umo) if umo else frozenset(REGISTRY.names())
+        active = set(self.activation.names(umo)) if umo else set()
+
+        hits = []
+        for rank, (meta, score) in enumerate(
+            self.index.search(query, top_k=50, min_score=0.0), start=1
+        ):
+            passed = score >= min_score
+            hits.append(
+                {
+                    "rank": rank,
+                    "name": meta.name,
+                    "score": round(score, 4),
+                    "passed": passed,
+                    "in_top_k": passed and rank <= top_k,
+                    "would_activate": (
+                        passed
+                        and rank <= top_k
+                        and meta.name in allowed
+                        and (meta.risk != RISK_HIGH or self._allow_high_risk)
+                    ),
+                    "description": meta.description,
+                    "source": meta.source,
+                    "tags": list(meta.tags),
+                    "risk": meta.risk,
+                    "allowed": meta.name in allowed,
+                    "active": meta.name in active,
+                }
+            )
+
+        return json_response(
+            {
+                "query": query,
+                "top_k": top_k,
+                "min_score": min_score,
+                "info_tokens": self.index.informative_tokens(query),
+                "hits": hits,
+            }
+        )
+
+    async def page_clear_session(self):
+        """清空指定会话的激活表。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        umo = str(payload.get("umo") or "").strip()
+        if not umo:
+            return error_response("请提供 umo。")
+        previously = self.activation.names(umo)
+        cleared = self.activation.clear(umo)
+        turn = self._turns.pop(umo, None)
+        if turn is not None and turn.request is not None:
+            for name in previously:
+                injector.withdraw(turn.request, name)
+        return json_response({"umo": umo, "cleared": cleared})
+
+    async def page_toggle_source(self):
+        """启用或停用子插件，并把结果写回插件配置（重启后保持）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return error_response("请提供 name。")
+        enabled = bool(payload.get("enabled"))
+
+        known = set(REGISTRY.sources()) | set(self.loader.discover())
+        if name not in known:
+            return error_response(f"没有名为 {name} 的子插件。", status_code=404)
+
+        if enabled and name not in self.loader.loaded and not self.loader.load(name):
+            reason = self.loader.errors.get(name, "未知原因")
+            return error_response(f"子插件 {name} 加载失败：{reason}")
+
+        self.loader.set_enabled(name, enabled)
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
+        self._persist_sub_plugins()
+        return json_response(
+            {
+                "name": name,
+                "enabled": enabled,
+                "indexed": self.index.size,
+                "persisted": self._sub_disabled,
+            }
+        )
 
     # ------------------------------------------------------------------
     # 内部工具方法
@@ -387,7 +597,7 @@ class LazyToolsPlugin(Star):
         self._max_active = max(int(get("max_active_per_session", 12) or 1), 1)
         self._allow_high_risk = bool(get("allow_high_risk_auto", False))
         self._meta_enabled = bool(get("meta_tools_enabled", True))
-        self._sub_enabled = list(get("sub_plugins_enabled", []) or [])
+        self._sub_disabled = list(get("sub_plugins_disabled", []) or [])
         self._debug = bool(get("debug", False))
         self._search_top_k = max(self._top_k, 5) if self._top_k else 5
 
@@ -401,7 +611,7 @@ class LazyToolsPlugin(Star):
         )
 
     def _load_sub_plugins(self) -> None:
-        result = self.loader.load_all(self._sub_enabled)
+        result = self.loader.load_all(self._sub_disabled)
         for name, ok in result.items():
             if not ok:
                 logger.warning(
@@ -429,6 +639,40 @@ class LazyToolsPlugin(Star):
             if meta.ttl_seconds is not None
             else self._default_ttl_seconds
         )
+
+    def _persist_sub_plugins(self) -> None:
+        """把子插件启停状态写回插件配置。
+
+        存的是**停用名单**：空列表表示「全部启用」。用停用名单而不是启用名单，
+        是因为启用名单里的空列表无法区分「一个都不启用」和「留空 = 全部启用」，
+        会把「全停」静默变成「全开」。
+        """
+        all_sources = sorted(set(REGISTRY.sources()) | set(self.loader.discover()))
+        value = [name for name in all_sources if not REGISTRY.is_source_enabled(name)]
+        self._sub_disabled = value
+        try:
+            self.config["sub_plugins_disabled"] = value
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as exc:  # noqa: BLE001 - 落盘失败只影响持久化，不影响本次运行
+            logger.warning("[lazy-tools] 子插件状态写入配置失败（仅本次运行生效）：%s", exc)
+
+    @staticmethod
+    def _clamp_int(value: Any, *, default: int, low: int, high: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, number))
+
+    @staticmethod
+    def _clamp_float(value: Any, *, default: float, low: float, high: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, number))
 
     def _gc_turns(self) -> None:
         if len(self._turns) <= _TURN_MAX_ENTRIES:

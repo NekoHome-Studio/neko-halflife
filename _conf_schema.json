@@ -59,11 +59,11 @@
     "default": true,
     "hint": "搜索 / 激活 / 取消激活。预检索未命中时模型可自行搜索激活。关闭后模型只能看到预检索命中的工具"
   },
-  "sub_plugins_enabled": {
-    "description": "启用的子插件包",
+  "sub_plugins_disabled": {
+    "description": "停用的子插件包",
     "type": "list",
     "default": [],
-    "hint": "填写 sub_plugins/ 下的子插件名；留空表示启用全部。子插件是被禁用的工具集，随时可通过 /lazy sub on|off <名字> 切换"
+    "hint": "填写 sub_plugins/ 下要停用的子插件名；留空表示全部启用。用停用名单而不是启用名单，是因为后者无法区分「一个都不启用」和「留空=全部启用」。也可在 WebUI 的 Pages 面板或 /lazy_sub on|off 里切换，会自动写回这里"
   },
   "debug": {
     "description": "输出每轮注入明细日志",

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>懒加载工具</title>
+    <!-- 相对路径引用资源：dashboard 会重写 src/href，不要手写 /api/plugin/page/content/... -->
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="page-header">
+        <div class="page-title">
+          <h1 id="heading">懒加载工具</h1>
+          <p id="subheading" class="muted"></p>
+        </div>
+        <div class="page-actions">
+          <span id="state-badge" class="badge badge-neutral">读取中…</span>
+          <button id="refresh-button" type="button" class="btn">刷新</button>
+        </div>
+      </header>
+
+      <div id="page-error" class="alert" hidden></div>
+
+      <section class="cards" id="overview"></section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="playground-title">检索试跑</h2>
+          <span class="muted" id="playground-hint"></span>
+        </div>
+        <div class="playground-controls">
+          <input
+            id="query-input"
+            type="text"
+            placeholder="输入一句用户可能会说的话，例如：帮我把这句话回显一下"
+            autocomplete="off"
+          />
+          <label class="field-inline">
+            <span id="label-topk">top_k</span>
+            <input id="topk-input" type="number" min="1" max="50" step="1" />
+          </label>
+          <label class="field-inline">
+            <span id="label-threshold">阈值</span>
+            <input id="threshold-input" type="number" min="0" max="1" step="0.05" />
+          </label>
+          <button id="search-button" type="button" class="btn btn-primary">试跑</button>
+        </div>
+        <div id="search-summary" class="muted"></div>
+        <div id="search-result"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="tools-title">工具清单</h2>
+          <span class="muted" id="tools-summary"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th id="th-name">工具名</th>
+                <th id="th-source">来源</th>
+                <th id="th-tags">标签</th>
+                <th id="th-ttl">存活</th>
+                <th id="th-risk">风险</th>
+                <th id="th-desc">描述</th>
+              </tr>
+            </thead>
+            <tbody id="tools-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="sources-title">子插件</h2>
+          <span class="muted" id="sources-hint"></span>
+        </div>
+        <div id="sources-list" class="sources"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="sessions-title">会话激活表</h2>
+          <span class="muted" id="sessions-summary"></span>
+        </div>
+        <div id="sessions-list" class="sessions"></div>
+      </section>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <!-- 必须是 module 且外部引用：bridge SDK 由 dashboard 注入，先于本脚本执行 -->
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

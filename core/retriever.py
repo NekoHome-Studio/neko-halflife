@@ -179,6 +179,14 @@ class ToolIndex:
         scored.sort(key=lambda item: (-item[1], item[0].name))
         return scored[: max(top_k, 0)]
 
+    def informative_tokens(self, query: str) -> list[str]:
+        """返回查询里真正出现在倒排表中的 token。
+
+        这是排查「为什么没命中」的第一现场：列表为空就说明这句话里的词
+        与任何工具的名字/标签/描述/示例都没有交集，此时不该怀疑阈值。
+        """
+        return sorted(token for token in tokenize(query) if token in self._postings)
+
     def describe_scores(self, query: str, tools: Sequence[str]) -> dict[str, float]:
         """调试用：给出指定工具名与查询的匹配分。"""
         result = {name: 0.0 for name in tools}

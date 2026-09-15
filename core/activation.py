@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 logger = logging.getLogger("astrbot_plugin_lazy_tools")
 
@@ -172,6 +172,38 @@ class ActivationStore:
 
     def total_activations(self) -> int:
         return sum(len(t) for t in self._sessions.values())
+
+    def describe(self) -> list[dict[str, Any]]:
+        """给 WebUI 用的可序列化快照。
+
+        单调时钟只在本模块内部使用，对外一律换算成「还剩多少秒」，
+        避免把 ``time.monotonic()`` 的裸值暴露出去造成误读。
+        """
+        now = self._clock()
+        sessions: list[dict[str, Any]] = []
+        for umo, table in self._sessions.items():
+            tools = []
+            for act in table.values():
+                if act.is_expired(now):
+                    continue
+                tools.append(
+                    {
+                        "name": act.name,
+                        "remaining_turns": act.remaining_turns,
+                        "expires_in": (
+                            None
+                            if act.expires_at is None
+                            else round(max(0.0, act.expires_at - now), 1)
+                        ),
+                        "score": round(act.score, 3),
+                        "hits": act.hits,
+                    }
+                )
+            if tools:
+                tools.sort(key=lambda item: (-item["score"], item["name"]))
+                sessions.append({"umo": umo, "count": len(tools), "tools": tools})
+        sessions.sort(key=lambda item: item["umo"])
+        return sessions
 
     # ---- 内部 ----------------------------------------------------------
 
