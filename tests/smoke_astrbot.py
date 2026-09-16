@@ -569,6 +569,31 @@ def main() -> int:
         resp = asyncio.run(plugin.page_upload_subplugin())
         check(resp.status_code == 400, "非法名字（连字符）被拒")
 
+        # ---- 上传：装了但零工具，必须当场报错而不是静默成功 ----
+        plugin_main.request = FakeWebRequest(
+            {},
+            files={
+                "file": FakeUpload(
+                    "empty_tools.py",
+                    "value = 1\n\n\nasync def not_a_tool(event):\n"
+                    '    """没有任何装饰器。"""\n'
+                    "    return 1\n".encode("utf-8"),
+                )
+            },
+        )
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        message = body_of(resp).get("message", "")
+        check(resp.status_code == 400, "零工具的上传被拒（不再静默成功）")
+        check("没有找到任何工具" in message, f"错误信息说明原因：{message[:44]}…")
+        check(
+            not (scratch / "empty_tools.py").exists(),
+            "零工具时文件已回滚删除",
+        )
+        check(
+            REGISTRY.get("not_a_tool") is None,
+            "零工具时没有在注册表里留下痕迹",
+        )
+
         # ---- 上传：正常单文件 ----
         code = "\n".join(
             [

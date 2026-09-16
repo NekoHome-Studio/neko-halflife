@@ -687,6 +687,7 @@ class LazyToolsPlugin(Star):
         # （Star 子类 + AstrBot 装饰器），就宿主它；并检测脏注册。
         mode = "native"
         host_result = None
+        analysis = None
         if loaded:
             analysis = plugin_import.analyze_plugin_dir(dest)
             mode = analysis.mode
@@ -725,11 +726,31 @@ class LazyToolsPlugin(Star):
                 )
             )
 
+        # 「装上了但一个工具都没有」必须当场报错，不能静默成功。
+        # 否则用户看到的是「子插件装好了，但工具清单里什么都没有」，无从排查。
+        source_tools = [meta.name for meta in REGISTRY.all() if meta.source == name]
+        bound_handlers = list(host_result.bound_handlers) if host_result else []
+        if not source_tools and not bound_handlers:
+            await self._unhost_async(name)
+            self._forget_source_tools(name)
+            uploads.remove_subplugin(self.loader.root, name)
+            self.loader.loaded.discard(name)
+            self.loader.errors.pop(name, None)
+            self._rebuild_index()
+            detail = "；".join(getattr(analysis, "reasons", []) or []) or (
+                f"检测到的模式是 {mode}：包里的代码既没有 @lazy_tool 装饰的工具，"
+                "也没有可宿主的 Star 子类。子插件的工具请写成模块级普通函数并加上 "
+                "@lazy_tool，或直接上传一个常规插件包（含 Star 子类）。"
+            )
+            return error_response(
+                f"子插件 {name} 里没有找到任何工具，已回滚文件。{detail}"
+            )
+
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         self._persist_sub_plugins()
 
-        installed = len([m for m in REGISTRY.all() if m.source == name])
+        installed = len(source_tools)
         logger.warning(
             "[neko-halflife] 已通过 WebUI 安装子插件 %s（%s，模式 %s，%d 个工具）",
             name,
@@ -737,16 +758,13 @@ class LazyToolsPlugin(Star):
             mode,
             installed,
         )
-        if not loaded:
-            return error_response(
-                f"子插件 {name} 已写入 {dest}，但导入失败："
-                f"{self.loader.errors.get(name, '未知原因')}。请修正后重载插件。"
-            )
         return json_response(
             {
                 "name": name,
                 "path": str(dest),
+                "mode": mode,
                 "tools": installed,
+                "bound_handlers": bound_handlers,
                 "indexed": self.index.size,
                 "kind": "zip" if is_zip else "single_file",
             }
@@ -989,6 +1007,23 @@ class LazyToolsPlugin(Star):
                 f"{self.loader.errors.get(name, '未知原因')}"
             )
 
+        # 同上：导入完一个工具或处理器都没有，说明这个插件不会带来任何效果，
+        # 与其静默成功让人以为"搬进来了"，不如当场说清楚并回滚。
+        source_tools = [meta.name for meta in REGISTRY.all() if meta.source == name]
+        bound_handlers = (
+            list(host_result.bound_handlers) if host_result is not None else []
+        )
+        if not source_tools and not bound_handlers:
+            await self._rollback_import(dest, backup, name)
+            return error_response(
+                f"导入 {dir_name} 后没有找到任何工具或事件处理器，已回滚。"
+                + (
+                    "；".join(analysis.reasons)
+                    or "该插件的工具/命令没有在导入期注册（可能在 initialize() 里"
+                    "动态注册，本插件目前不调用它）。"
+                )
+            )
+
         if backup is not None:
             shutil.rmtree(backup, ignore_errors=True)
 
@@ -996,7 +1031,7 @@ class LazyToolsPlugin(Star):
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         self._persist_sub_plugins()
 
-        installed = [m.name for m in REGISTRY.all() if m.source == name]
+        installed = list(source_tools)
         logger.warning(
             "[neko-halflife] 已从插件 %s 导入 %d 个文件为子插件 %s（模式 %s，"
             "%d 个工具：%s）",
@@ -1014,9 +1049,7 @@ class LazyToolsPlugin(Star):
                 "mode": analysis.mode,
                 "files": copied,
                 "tools": installed,
-                "bound_handlers": list(host_result.bound_handlers)
-                if host_result is not None
-                else [],
+                "bound_handlers": list(bound_handlers),
                 "warnings": list(analysis.warnings)
                 + (list(host_result.warnings) if host_result is not None else []),
                 "indexed": self.index.size,
