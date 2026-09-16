@@ -10,7 +10,7 @@ desc: >-
   但在每轮请求发出前按用户输入做本地预检索，只把已激活工具的 Schema 交回给模型，
   未被激活的工具对模型不可见。省的是提示词预算与上下文窗口，不省工具执行算力。
   另附三个元工具（搜索/激活/取消激活）作为预检索未命中时的兜底。
-version: 0.3.0
+version: 0.4.0
 author: NekoHome-Studio
 repo: https://github.com/NekoHome-Studio/neko-halflife
 astrbot_version: ">=4.26.7,<5"

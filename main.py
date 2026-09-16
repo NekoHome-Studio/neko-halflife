@@ -30,6 +30,7 @@ runner（dify / coze / dashscope / deerflow）的工具清单来自远端平台�
 
 from __future__ import annotations
 
+import inspect
 import shutil
 import time
 from pathlib import Path
@@ -42,7 +43,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
 try:
-    from .core import injector, plugin_import, uploads
+    from .core import injector, plugin_host, plugin_import, uploads
     from .core.activation import ActivationStore
     from .core.models import RISK_HIGH, ToolMeta, TurnContext
     from .core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -50,7 +51,7 @@ try:
     from .core.subplugins import SubPluginLoader
     from .core.uploads import UploadError
 except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
-    from core import injector, plugin_import, uploads
+    from core import injector, plugin_host, plugin_import, uploads
     from core.activation import ActivationStore
     from core.models import RISK_HIGH, ToolMeta, TurnContext
     from core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -89,6 +90,8 @@ class LazyToolsPlugin(Star):
         self.activation = ActivationStore()
         self.loader = SubPluginLoader(Path(__file__).resolve().parent, REGISTRY)
         self._turns: dict[str, TurnContext] = {}
+        #: 宿主模式下的子插件实例（name -> HostResult），删除/卸载时要停掉它们
+        self._hosted: dict[str, Any] = {}
         self._apply_config(config)
         self._register_web_apis()
 
@@ -102,7 +105,7 @@ class LazyToolsPlugin(Star):
         索引必须在子插件导入之后建，否则子插件的工具不会进入检索候选。
         """
         self._apply_config(self.config)
-        self._load_sub_plugins()
+        await self._load_sub_plugins()
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         logger.info(
@@ -118,9 +121,18 @@ class LazyToolsPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """卸载清理。注册表是模块级单例，这里只清会话状态，不动工具定义。"""
+        """卸载清理。
+
+        宿主子插件的实例必须在这里停掉并解绑——它们的工具与事件处理器注册在
+        AstrBot 全局表里，不主动清理会在本插件卸载后继续被调用，而实例已经不在了。
+        """
+        for name in list(self._hosted):
+            try:
+                await self._unhost_async(name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[neko-halflife] 卸载宿主子插件 %s 失败：%s", name, exc)
         self._turns.clear()
-        logger.info("[neko-halflife] 已卸载，会话状态已清理")
+        logger.info("[neko-halflife] 已卸载，会话状态与宿主子插件已清理")
 
     # ------------------------------------------------------------------
     # 核心：每轮请求前的注入决策
@@ -667,19 +679,63 @@ class LazyToolsPlugin(Star):
             staged.unlink(missing_ok=True)
 
         # 落盘之后才导入并执行——这一步才会真正跑子插件里的代码
-        loaded = self.loader.load(name)
         self.loader.set_enabled(name, True)
+        before_tools = self._global_tool_names()
+        loaded = self.loader.load(name)
+
+        # 与"从已装插件导入"同一套收尾：上传的包里如果是个常规插件
+        # （Star 子类 + AstrBot 装饰器），就宿主它；并检测脏注册。
+        mode = "native"
+        host_result = None
+        if loaded:
+            analysis = plugin_import.analyze_plugin_dir(dest)
+            mode = analysis.mode
+            if analysis.has_star_class:
+                plugin_import.write_host_marker(dest, mode="hosted", source_dir=name)
+                host_result = self._ensure_hosted(name)
+                if host_result is None or not host_result.ok:
+                    loaded = False
+        stray = sorted(
+            tool
+            for tool in (self._global_tool_names() - before_tools)
+            if REGISTRY.get(tool) is None
+        )
+
+        if not loaded or stray:
+            for tool in stray:
+                self._remove_global_tool(tool)
+            await self._unhost_async(name)
+            self._forget_source_tools(name)
+            uploads.remove_subplugin(self.loader.root, name)
+            self.loader.loaded.discard(name)
+            self.loader.errors.pop(name, None)
+            self._rebuild_index()
+            if stray:
+                return error_response(
+                    f"上传的包注册了 {len(stray)} 个非本插件的工具"
+                    f"（{', '.join(stray[:5])}），已清理并回滚文件。"
+                )
+            return error_response(
+                f"子插件 {name} 导入失败，已回滚文件："
+                f"{self.loader.errors.get(name, '未知原因')}"
+                + (
+                    "；宿主失败：" + "；".join(host_result.errors)
+                    if host_result is not None and not host_result.ok
+                    else ""
+                )
+            )
+
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         self._persist_sub_plugins()
 
         installed = len([m for m in REGISTRY.all() if m.source == name])
         logger.warning(
-            "[neko-halflife] 已通过 WebUI 安装子插件 %s（%s，%d 个工具，导入%s）",
+            "[neko-halflife] 已通过 WebUI 安装子插件 %s（%s，模式 %s，%d 个工具）",
             name,
             dest,
+            mode,
             installed,
-            "成功" if loaded else f"失败：{self.loader.errors.get(name, '未知原因')}",
         )
         if not loaded:
             return error_response(
@@ -709,6 +765,9 @@ class LazyToolsPlugin(Star):
         except UploadError as exc:
             return error_response(str(exc))
 
+        # 宿主模式要先停掉实例并解绑事件处理器：只删工具不够，
+        # 命令/钩子仍挂在全局表里，实例没了以后一触发就报错。
+        await self._unhost_async(name)
         removed_tools = self._forget_source_tools(name)
         removed_files = uploads.remove_subplugin(self.loader.root, name)
         self.loader.loaded.discard(name)
@@ -883,11 +942,27 @@ class LazyToolsPlugin(Star):
         try:
             copied = plugin_import.copy_plugin_tree(src, dest, overwrite=True)
             plugin_import.write_entry(dest, analysis.tool_modules)
+            # 先落宿主标记：万一进程在下面中途挂掉，重启后 load_all 也能按标记续接
+            # 宿主，而不是留下「装饰器注册了工具、却没人实例化」的坏状态。
+            plugin_import.write_host_marker(
+                dest, mode=analysis.mode, source_dir=dir_name
+            )
         except Exception as exc:  # noqa: BLE001
-            self._rollback_import(dest, backup, name)
+            await self._rollback_import(dest, backup, name)
             return error_response(f"复制失败，已回滚：{exc}")
 
+        self.loader.set_enabled(name, True)
         loaded = self.loader.load(name)
+
+        host_result = None
+        if loaded and analysis.mode == "hosted":
+            # 常规插件：实例化它的 Star 类并把工具/事件处理器绑上去，同时把它纳入
+            # 本插件注册表 —— 这样它们才会被按需注入。走 _ensure_hosted 而不是直接
+            # 调 host_module：它会把实例记进 self._hosted，删除/卸载时才找得到。
+            host_result = self._ensure_hosted(name)
+            if host_result is None or not host_result.ok:
+                loaded = False
+
         # 脏注册 = 导入后新出现、且不在本插件注册表里的工具
         stray = sorted(
             tool
@@ -898,12 +973,16 @@ class LazyToolsPlugin(Star):
         if not loaded or stray:
             for tool in stray:
                 self._remove_global_tool(tool)
-            self._rollback_import(dest, backup, name)
+            await self._rollback_import(dest, backup, name)
             if stray:
                 return error_response(
                     f"导入失败并已回滚：检测到 {len(stray)} 个非本插件的工具被注册"
                     f"（{', '.join(stray[:5])}），已从全局工具表清理。"
-                    "该插件很可能用了 AstrBot 自带的工具装饰器。"
+                )
+            if host_result is not None and not host_result.ok:
+                return error_response(
+                    "导入失败并已回滚：宿主该插件失败 —— "
+                    + "；".join(host_result.errors)
                 )
             return error_response(
                 f"导入失败并已回滚：模块无法加载 —— "
@@ -913,17 +992,18 @@ class LazyToolsPlugin(Star):
         if backup is not None:
             shutil.rmtree(backup, ignore_errors=True)
 
-        self.loader.set_enabled(name, True)
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         self._persist_sub_plugins()
 
         installed = [m.name for m in REGISTRY.all() if m.source == name]
         logger.warning(
-            "[neko-halflife] 已从插件 %s 导入 %d 个文件为子插件 %s（%d 个工具：%s）",
+            "[neko-halflife] 已从插件 %s 导入 %d 个文件为子插件 %s（模式 %s，"
+            "%d 个工具：%s）",
             dir_name,
             copied,
             name,
+            analysis.mode,
             len(installed),
             ", ".join(installed[:5]) or "无",
         )
@@ -931,15 +1011,23 @@ class LazyToolsPlugin(Star):
             {
                 "name": name,
                 "source": dir_name,
+                "mode": analysis.mode,
                 "files": copied,
                 "tools": installed,
-                "warnings": analysis.warnings,
+                "bound_handlers": list(host_result.bound_handlers)
+                if host_result is not None
+                else [],
+                "warnings": list(analysis.warnings)
+                + (list(host_result.warnings) if host_result is not None else []),
                 "indexed": self.index.size,
             }
         )
 
-    def _rollback_import(self, dest: Path, backup: Path | None, name: str) -> None:
-        """回滚一次导入：清注册、删新目录、还原旧版本。"""
+    async def _rollback_import(
+        self, dest: Path, backup: Path | None, name: str
+    ) -> None:
+        """回滚一次导入：先停宿主，再清注册、删新目录、还原旧版本。"""
+        await self._unhost_async(name)
         self._forget_source_tools(name)
         self.loader.loaded.discard(name)
         self.loader.errors.pop(name, None)
@@ -1127,7 +1215,7 @@ class LazyToolsPlugin(Star):
             max_per_session=self._max_active,
         )
 
-    def _load_sub_plugins(self) -> None:
+    async def _load_sub_plugins(self) -> None:
         result = self.loader.load_all(self._sub_disabled)
         for name, ok in result.items():
             if not ok:
@@ -1136,8 +1224,13 @@ class LazyToolsPlugin(Star):
                     name,
                     self.loader.errors.get(name, "未知原因"),
                 )
-        # 注册表里还留着、但目录已经不在的子插件：把它们的工具一并清干净。
+                continue
+            # 宿主模式的子插件光是导入不够：它的装饰器已经把工具/命令注册进全局表，
+            # 但没人实例化它的 Star 类。不续接宿主就会变成「每轮注入但一调用就报错」。
+            self._ensure_hosted(name)
+        # 注册表里还留着、但目录已经不在的子插件：把工具与事件处理器一并清干净。
         for stale in sorted(set(REGISTRY.sources()) - set(result)):
+            await self._unhost_async(stale)
             removed = self._forget_source_tools(stale)
             self.loader.loaded.discard(stale)
             logger.info(
@@ -1145,6 +1238,71 @@ class LazyToolsPlugin(Star):
                 stale,
                 removed,
             )
+
+    def _ensure_hosted(self, name: str) -> Any | None:
+        """按宿主标记接管一个子插件；返回 HostResult（不需要宿主则为 None）。"""
+        dest = self.loader.root / name
+        marker = plugin_import.read_host_marker(dest)
+        if not marker or marker.get("mode") != "hosted":
+            return None
+        if not REGISTRY.is_source_enabled(name):
+            return None
+
+        module_prefix = self.loader.module_name_for(name)
+        result = plugin_host.host_module(
+            module_prefix,
+            dest,
+            str(marker.get("source_dir") or name),
+            self.context,
+        )
+        if not result.ok:
+            logger.error(
+                "[neko-halflife] 宿主子插件 %s 失败：%s",
+                name,
+                "；".join(result.errors),
+            )
+            plugin_host.unhost_module(module_prefix)
+            return result
+
+        for meta in result.tool_metas:
+            REGISTRY.register(meta)
+        self._hosted[name] = result
+        self._rebuild_index()
+        for warning in result.warnings:
+            logger.warning("[neko-halflife] 子插件 %s：%s", name, warning)
+        logger.info(
+            "[neko-halflife] 已宿主子插件 %s（%s）：绑定工具 %d 个、事件处理器 %d 个",
+            name,
+            result.class_name,
+            len(result.bound_tools),
+            len(result.bound_handlers),
+        )
+        return result
+
+    def _unhost(self, name: str) -> Any:
+        """停掉宿主子插件的**同步部分**：解绑、移除工具与事件处理器。
+
+        ``terminate()`` 是协程，所以放在 :meth:`_unhost_async` 里 await。
+        """
+        result = self._hosted.pop(name, None)
+        plugin_host.unhost_module(self.loader.module_name_for(name))
+        return result
+
+    async def _unhost_async(self, name: str) -> None:
+        """停掉宿主子插件，并尽量 await 它的 ``terminate()``。"""
+        result = self._unhost(name)
+        instance = getattr(result, "instance", None) if result else None
+        if instance is None:
+            return
+        terminate = getattr(instance, "terminate", None)
+        if not callable(terminate):
+            return
+        try:
+            maybe = terminate()
+            if inspect.isawaitable(maybe):
+                await maybe
+        except Exception as exc:  # noqa: BLE001 - 外来 terminate 什么都可能抛
+            logger.warning("[neko-halflife] %s.terminate() 报错：%s", name, exc)
 
     def _forget_source_tools(self, source: str) -> int:
         """移除某个来源的全部工具，并保证它们**再也不会被注入**。

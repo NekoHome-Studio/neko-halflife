@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 import importlib
 import importlib.util
 import json
@@ -211,6 +212,7 @@ def main() -> int:
     plugin.index = ToolIndex()
     plugin.loader = SubPluginLoader(PLUGIN_ROOT, REGISTRY)
     plugin._turns = {}
+    plugin._hosted = {}
     plugin._apply_config(
         {
             "enabled": True,
@@ -827,6 +829,24 @@ def main() -> int:
         "async def bad_tool(self, event):\n"
         "    return 'x'\n",
     )
+    # 常规插件：Star 子类 + AstrBot 装饰器 → 走宿主模式
+    write_plugin(
+        "hosted_tools",
+        "from astrbot.api.event import filter\n"
+        "from astrbot.api.star import Star\n\n\n"
+        "class HostedPlugin(Star):\n"
+        "    def __init__(self, context, config=None):\n"
+        "        super().__init__(context)\n"
+        "        self.calls = 0\n\n"
+        "    @filter.command('hostedping')\n"
+        "    async def hosted_ping(self, event):\n"
+        "        return 'pong'\n\n"
+        "    @filter.llm_tool(name='hosted_tool')\n"
+        "    async def hosted_tool(self, event, text: str):\n"
+        '        """宿主工具。\n\n        Args:\n            text(string): 内容\n        """\n'
+        "        self.calls += 1\n"
+        "        return f'hosted:{text}:{self.calls}'\n",
+    )
     # 静态扫描看不出来、只在导入期才注册脏工具的插件（用于测运行期兜底）
     write_plugin(
         "sneaky",
@@ -867,8 +887,13 @@ def main() -> int:
         check("good_tools" in by_dir and by_dir["good_tools"]["portable"], "普通函数工具集可导入")
         check(
             not by_dir["bad_tools"]["portable"]
-            and any("AstrBot" in r for r in by_dir["bad_tools"]["reasons"]),
-            "用 @filter.llm_tool 的插件在候选列表里就标为不可导入",
+            and any("Star 子类" in r for r in by_dir["bad_tools"]["reasons"]),
+            "没有 Star 子类可实例化的插件标为不可导入",
+        )
+        check(
+            by_dir["hosted_tools"]["portable"]
+            and by_dir["hosted_tools"]["mode"] == "hosted",
+            f"常规插件判定为可导入并走宿主模式：{by_dir['hosted_tools']['mode']}",
         )
 
         # ---- 导入成功 ----
@@ -906,11 +931,81 @@ def main() -> int:
         resp = asyncio.run(plugin.page_import_apply())
         check(resp.status_code == 400, "目录穿越被拒")
 
+        # ---- 宿主模式：常规插件被实例化、绑定，并纳入懒加载 ----
+        plugin_main.request = FakeWebRequest({"dir_name": "hosted_tools"})
+        resp = asyncio.run(plugin.page_import_apply())
+        payload = body_of(resp)
+        check(
+            resp.status_code == 200 and payload.get("mode") == "hosted",
+            f"宿主模式导入成功：{payload}",
+        )
+        host = plugin._hosted.get("hosted_tools")
+        check(
+            host is not None and host.instance is not None,
+            "Star 类已被实例化（AstrBot 不会做这件事，模块路径不匹配）",
+        )
+        check(
+            "hosted_tool" in REGISTRY.names(),
+            "宿主插件的工具进了本插件注册表 —— 因此会被按需注入而不是每轮下发",
+        )
+        hosted_ft = next(
+            (t for t in llm_tools.func_list if t.name == "hosted_tool"), None
+        )
+        check(hosted_ft is not None, "宿主插件的工具在 AstrBot 全局表里")
+        check(
+            isinstance(getattr(hosted_ft, "handler", None), functools.partial),
+            "工具 handler 已 partial 到宿主实例上",
+        )
+        # 真的调用一次，证明 self 绑定正确（这正是去掉 @lazy_tool 限制的意义）
+        called = asyncio.run(hosted_ft.handler(None, text="hi"))
+        check(
+            called == "hosted:hi:1",
+            f"绑定后的工具可正常调用：{called}",
+        )
+
+        from astrbot.core.star.star_handler import (
+            star_handlers_registry as _registry,
+        )
+
+        cmd_handler = next(
+            (h for h in _registry._handlers if h.handler_name == "hosted_ping"), None
+        )
+        check(
+            cmd_handler is not None
+            and isinstance(cmd_handler.handler, functools.partial),
+            "命令处理器也已绑定实例（不绑的话一触发就报错）",
+        )
+        check(
+            asyncio.run(cmd_handler.handler(None)) == "pong",
+            "绑定后的命令可正常调用",
+        )
+        check(
+            (sub_root / "hosted_tools" / plugin_import.HOST_MARKER).is_file(),
+            "写入了宿主标记（重启后据此续接宿主）",
+        )
+
+        # ---- 删除宿主子插件：工具与处理器都必须清干净 ----
+        plugin_main.request = FakeWebRequest({"name": "hosted_tools"})
+        asyncio.run(plugin.page_delete_subplugin())
+        check(
+            "hosted_tool" not in {t.name for t in llm_tools.func_list},
+            "删除后工具已从全局表移除",
+        )
+        check(
+            next(
+                (h for h in _registry._handlers if h.handler_name == "hosted_ping"),
+                None,
+            )
+            is None,
+            "删除后命令处理器已从全局表移除（否则实例没了仍会被触发）",
+        )
+        check("hosted_tools" not in plugin._hosted, "宿主实例已注销")
+
         # ---- 运行期兜底：静态扫描漏掉的脏注册必须被拦下并回滚 ----
         stray_before = "stray_tool_xyz" in {t.name for t in llm_tools.func_list}
         check(not stray_before, "前置条件：脏工具此刻不在全局表里")
         plugin_import.analyze_plugin_dir = lambda path: plugin_import.ImportAnalysis(
-            dir_name=path.name, portable=True, tool_modules=["main"]
+            dir_name=path.name, portable=True, mode="native", import_modules=["main"]
         )
         plugin_main.request = FakeWebRequest({"dir_name": "sneaky"})
         resp = asyncio.run(plugin.page_import_apply())

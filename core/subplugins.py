@@ -113,6 +113,14 @@ class SubPluginLoader:
             return package
         return None
 
+    def module_name_for(self, name: str) -> str:
+        """该子插件模块的完整模块名。
+
+        宿主模式要用它匹配 ``handler_module_path``（AstrBot 比对模块路径时是
+        **精确匹配**，所以前缀必须完全一致）。
+        """
+        return f"{_package_prefix()}.{SUBDIR_NAME}.{name}"
+
     # ---- 加载 ----------------------------------------------------------
 
     def load(self, name: str) -> bool:
@@ -121,7 +129,7 @@ class SubPluginLoader:
         if path is None:
             self.errors[name] = "未找到入口文件"
             return False
-        module_name = f"{_package_prefix()}.{SUBDIR_NAME}.{name}"
+        module_name = self.module_name_for(name)
         try:
             if path.parent.name == name:  # 包形态
                 spec = importlib.util.spec_from_file_location(

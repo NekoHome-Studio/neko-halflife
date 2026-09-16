@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -42,11 +43,15 @@ _DEF_AFTER_DECOR_RE = re.compile(
     r"@\s*lazy_tool\b[^\n]*\n(?:\s*(?:#[^\n]*)?\n)*\s*(?:async\s+)?def\s+([A-Za-z_]\w*)"
 )
 
-#: AstrBot 自己的工具注册装饰器：导入即有全局副作用，且期望 ``self``。
+#: AstrBot 自己的工具注册装饰器：导入时有全局副作用，需要宿主模式接管。
 _ASTRBOT_TOOL_RE = re.compile(
     r"@\s*(?:filter\.|event_filter\.)?(?:register_llm_tool|llm_tool)\b"
 )
 _ASTRBOT_DIRECT_RE = re.compile(r"\bregister_llm_tool\s*\(")
+
+#: 任意 AstrBot filter 装饰器（命令、钩子、监听器……）。它们同样在导入期注册，
+#: 因此这些模块必须被导入，导入后也必须绑 self。
+_ASTRBOT_ANY_DECOR_RE = re.compile(r"@\s*(?:filter|event_filter)\.\w+")
 
 #: ``class Xxx(Star)`` 或 ``class Xxx(filter.Star)`` 之类
 _STAR_CLASS_RE = re.compile(r"class\s+\w+\s*\([^)]*\bStar\b[^)]*\)")
@@ -61,17 +66,25 @@ class ImportAnalysis:
 
     dir_name: str
     portable: bool = False
+    mode: str = "rejected"
+    """``native``：用本插件 @lazy_tool 写的工具集，直接加载。
+    ``hosted``：用 AstrBot 装饰器的常规插件，由本插件实例化 Star 类并绑定。
+    ``rejected``：无法导入。"""
+
     reasons: list[str] = field(default_factory=list)
     """阻断原因。非空即 ``portable=False``。"""
 
     warnings: list[str] = field(default_factory=list)
     lazy_tool_names: list[str] = field(default_factory=list)
     astrbot_tool_hits: list[str] = field(default_factory=list)
-    """命中的 AstrBot 工具装饰器所在文件（有就是硬拒绝）。"""
+    """命中 AstrBot 工具装饰器（如 @filter.llm_tool）的文件。"""
+
+    astrbot_decor_hits: list[str] = field(default_factory=list)
+    """命中任意 AstrBot filter 装饰器（命令/钩子等）的文件。"""
 
     has_star_class: bool = False
-    tool_modules: list[str] = field(default_factory=list)
-    """含 ``@lazy_tool`` 的模块路径（相对包根，点分）。生成的 __init__ 会导入它们。"""
+    import_modules: list[str] = field(default_factory=list)
+    """生成的包入口需要导入的模块（点分，相对包根）。"""
 
     py_files: list[str] = field(default_factory=list)
     total_files: int = 0
@@ -81,15 +94,22 @@ class ImportAnalysis:
         return {
             "dir_name": self.dir_name,
             "portable": self.portable,
+            "mode": self.mode,
             "reasons": list(self.reasons),
             "warnings": list(self.warnings),
             "lazy_tool_names": list(self.lazy_tool_names),
             "astrbot_tool_hits": list(self.astrbot_tool_hits),
+            "astrbot_decor_hits": list(self.astrbot_decor_hits),
             "has_star_class": self.has_star_class,
-            "tool_modules": list(self.tool_modules),
+            "import_modules": list(self.import_modules),
             "total_files": self.total_files,
             "total_bytes": self.total_bytes,
         }
+
+    @property
+    def tool_modules(self) -> list[str]:
+        """兼容旧名字：生成的入口要导入的模块。"""
+        return self.import_modules
 
 
 def _iter_source_files(plugin_dir: Path) -> list[Path]:
@@ -146,19 +166,29 @@ def analyze_plugin_dir(plugin_dir: Path) -> ImportAnalysis:
     ]
 
     lazy_hits = 0
+    module_order: list[str] = []
+
+    def remember(dotted: str) -> None:
+        if dotted and dotted not in module_order:
+            module_order.append(dotted)
+
     for path in py_files:
         relative = path.relative_to(plugin_dir)
+        dotted = _module_dotted(relative)
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             analysis.warnings.append(f"读取 {relative.as_posix()} 失败：{exc}")
             continue
 
-        if _STAR_CLASS_RE.search(text):
+        star_here = bool(_STAR_CLASS_RE.search(text))
+        if star_here:
             analysis.has_star_class = True
 
         if _ASTRBOT_TOOL_RE.search(text) or _ASTRBOT_DIRECT_RE.search(text):
             analysis.astrbot_tool_hits.append(relative.as_posix())
+        if _ASTRBOT_ANY_DECOR_RE.search(text):
+            analysis.astrbot_decor_hits.append(relative.as_posix())
 
         for match in _LAZY_NAME_RE.finditer(text):
             name = match.group(1).strip()
@@ -172,35 +202,55 @@ def analyze_plugin_dir(plugin_dir: Path) -> ImportAnalysis:
         count = len(_LAZY_DECOR_RE.findall(text))
         if count:
             lazy_hits += count
-            dotted = _module_dotted(relative)
-            if dotted and dotted not in analysis.tool_modules:
-                analysis.tool_modules.append(dotted)
+            remember(dotted)
+
+        # 宿主模式要导入"定义了 Star 类"或"用了 AstrBot 装饰器"的模块，
+        # 否则那些装饰器不会执行、工具与命令都不会注册。
+        if star_here or _ASTRBOT_ANY_DECOR_RE.search(text):
+            remember(dotted)
+
+    analysis.import_modules = module_order
 
     # ---- 判定 ----
     if plugin_dir.name in SELF_NAMES:
         analysis.reasons.append("这是本插件自己，不能导入为自身的子插件。")
 
-    if analysis.astrbot_tool_hits:
+    if lazy_hits:
+        analysis.mode = "native"
+    elif analysis.has_star_class:
+        analysis.mode = "hosted"
+    else:
+        analysis.mode = "rejected"
         analysis.reasons.append(
-            "含 AstrBot 自带的工具装饰器（如 @filter.llm_tool）："
-            f"{', '.join(analysis.astrbot_tool_hits[:3])}。"
-            "这类装饰器在导入时就会把工具注册进 AstrBot 全局表，"
-            "而它们的 handler 需要 self（本插件的加载器不会实例化 Star 类），"
-            "结果是「每轮都被注入但一调用就报错」。"
+            "既没有用 @lazy_tool 写模块级工具，也没有 Star 子类可供实例化 —— "
+            "导入后无法注册任何东西。"
         )
 
-    if not lazy_hits:
-        analysis.reasons.append(
-            "没有找到任何 @lazy_tool。子插件的工具必须用本插件的 @lazy_tool 装饰"
-            "（写成模块级普通函数，第一个参数是 event），否则导入后不会注册任何工具。"
-        )
-
-    if analysis.has_star_class and lazy_hits:
+    if analysis.mode == "native":
+        if analysis.astrbot_tool_hits:
+            analysis.warnings.append(
+                "同时检测到 AstrBot 自带的工具装饰器"
+                f"（{', '.join(analysis.astrbot_tool_hits[:3])}）。本插件把它们当作"
+                "普通工具代码导入，这些装饰器会在导入期把它们注册进 AstrBot 全局表，"
+                "但不会有人给它们绑 self —— 调用会失败。建议改用 @lazy_tool 重写。"
+            )
+        if analysis.has_star_class:
+            analysis.warnings.append(
+                "插件里定义了 Star 子类。native 模式不会实例化它，"
+                "该类里的东西（initialize、命令、监听器等）不会被激活；"
+                "只有模块级、用 @lazy_tool 装饰的普通函数会生效。"
+            )
+    else:  # hosted
         analysis.warnings.append(
-            "插件里定义了 Star 子类。本插件的加载器不会实例化它，"
-            "该类里的东西（initialize、命令、监听器等）不会被激活；"
-            "只有模块级、用 @lazy_tool 装饰的普通函数会生效。"
+            "宿主模式：本插件会自己实例化该 Star 子类（执行它的 __init__），"
+            "并把工具与事件处理器绑定到该实例上。它会以子插件身份运行，"
+            "与 AstrBot 原生加载互不影响；若原插件仍在启用，两者会各自持有一个实例。"
         )
+        if not analysis.astrbot_tool_hits:
+            analysis.warnings.append(
+                "没有检测到 LLM 工具装饰器：导入后可能只有命令/钩子生效，"
+                "不会有可懒加载的工具。"
+            )
 
     analysis.portable = not analysis.reasons
     return analysis
@@ -266,3 +316,33 @@ def write_entry(dest: Path, tool_modules: list[str]) -> Path:
     entry = Path(dest) / "__init__.py"
     entry.write_text(build_entry_source(tool_modules), encoding="utf-8")
     return entry
+
+
+#: 宿主标记文件名。放在子插件目录里，记录"这个包需要宿主模式"，
+#: 这样 AstrBot 重启后 `load_all()` 重新导入它时还能续接宿主，
+#: 而不是变成"装饰器注册了工具、却没人实例化 Star 类"的坏状态。
+HOST_MARKER = ".neko-host.json"
+
+
+def write_host_marker(dest: Path, *, mode: str, source_dir: str) -> Path:
+    path = Path(dest) / HOST_MARKER
+    path.write_text(
+        json.dumps(
+            {"mode": mode, "source_dir": source_dir, "hosted_by": "astrbot_plugin_neko_halflife"},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def read_host_marker(dest: Path) -> dict | None:
+    path = Path(dest) / HOST_MARKER
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None

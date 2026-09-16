@@ -527,7 +527,7 @@ def _plugin_import_body(raw: Path) -> None:
     check(analysis.lazy_tool_names == ["good_tool"], f"识别工具名：{analysis.lazy_tool_names}")
     check(analysis.tool_modules == ["main"], f"识别工具模块：{analysis.tool_modules}")
 
-    # 2) 拒绝：用了 AstrBot 自带的工具装饰器（导入即有全局副作用）
+    # 2) 拒绝：用了 AstrBot 装饰器，却没有 Star 子类可供实例化
     bad = make(
         "bad_tools",
         "from astrbot.api.event import filter\n\n"
@@ -536,11 +536,28 @@ def _plugin_import_body(raw: Path) -> None:
         "    return 'x'\n",
     )
     analysis = plugin_import.analyze_plugin_dir(bad)
-    check(not analysis.portable, "用 @filter.llm_tool 的插件被拒绝")
+    check(not analysis.portable, "没有任何 Star 子类的插件被拒绝")
     check(
-        any("AstrBot" in reason for reason in analysis.reasons),
-        "拒绝原因点名了 AstrBot 装饰器",
+        any("Star 子类" in reason for reason in analysis.reasons),
+        "拒绝原因点名缺少 Star 子类",
     )
+
+    # 2b) 宿主模式：常规插件（Star 子类 + @filter.llm_tool）现在可导入
+    hosted = make(
+        "hosted_tools",
+        "from astrbot.api.event import filter\n"
+        "from astrbot.api.star import Star\n\n\n"
+        "class HostedPlugin(Star):\n"
+        "    @filter.llm_tool(name='hosted_tool')\n"
+        "    async def hosted_tool(self, event, x: str):\n"
+        "        return x\n",
+    )
+    analysis = plugin_import.analyze_plugin_dir(hosted)
+    check(analysis.portable, f"常规插件判定为可导入（{analysis.reasons}）")
+    check(analysis.mode == "hosted", f"走宿主模式：{analysis.mode}")
+    check(analysis.has_star_class, "识别出 Star 子类")
+    check("main" in analysis.import_modules, f"入口要导入的模块：{analysis.import_modules}")
+    check(bool(analysis.warnings), "宿主模式给出提示")
 
     # 3) 拒绝：没有任何 @lazy_tool（导入后不会注册任何工具）
     plain = make("plain", "x = 1\n")
