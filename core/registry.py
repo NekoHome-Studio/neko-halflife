@@ -107,6 +107,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolMeta] = {}
         self._disabled_sources: set[str] = set()
+        self._retired_sources: set[str] = set()
 
     # ---- 写入 ----------------------------------------------------------
 
@@ -125,9 +126,32 @@ class ToolRegistry:
                 )
         self._tools[meta.name] = meta
 
+    def retire_source(self, source: str) -> int:
+        """把一个来源标记为「已退休」：保留工具定义，但保证它们再也不会被注入。
+
+        为什么保留定义而不是删掉：``injector.plan_pruning`` 把「注册表里查不到」
+        当成「不是本插件的工具」而**原样保留**。所以删掉定义反而会让工具继续注入。
+        保留定义 + 永不进入保留集 = 每轮必被裁掉，这才是安全的兜底。
+
+        用于删除子插件时：万一无法从 AstrBot 全局 ``llm_tools`` 移除，
+        也不能让这些工具因为「查不到」而被当成别人的工具照常注入。
+        """
+        self._retired_sources.add(source)
+        self._disabled_sources.add(source)
+        return sum(1 for meta in self._tools.values() if meta.source == source)
+
+    def is_source_retired(self, source: str) -> bool:
+        return source in self._retired_sources
+
     def set_source_enabled(self, source: str, enabled: bool) -> None:
+        """启用/停用来源。
+
+        启用会**解除退休**：管理员重新上传同名子插件并启用，是明确的授权动作，
+        如果继续按住退休标记，工具会被永久裁掉、看起来像「上传了但没生效」。
+        """
         if enabled:
             self._disabled_sources.discard(source)
+            self._retired_sources.discard(source)
         else:
             self._disabled_sources.add(source)
 
@@ -137,6 +161,7 @@ class ToolRegistry:
         for name in doomed:
             self._tools.pop(name, None)
         self._disabled_sources.discard(source)
+        self._retired_sources.discard(source)
         return len(doomed)
 
     # ---- 读取 ----------------------------------------------------------
@@ -175,6 +200,7 @@ class ToolRegistry:
     def clear(self) -> None:
         self._tools.clear()
         self._disabled_sources.clear()
+        self._retired_sources.clear()
 
 
 #: 全局注册表单例。

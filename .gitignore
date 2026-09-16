@@ -8,6 +8,8 @@ venv/
 # ---- 测试临时目录 ----
 # tests/smoke_astrbot.py 会把 AstrBot 的 data/ 重定向到这里，跑完自动删除
 .smoke-astrbot-root/
+# tests/selftest.py 的安装/删除往返测试拿它当 scratch，跑完自动删除
+.selftest-scratch/
 
 # ---- 版本兼容性验证用的 AstrBot 源码副本（见 README「版本敏感」）----
 .verify/

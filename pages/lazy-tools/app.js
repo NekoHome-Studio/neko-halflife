@@ -85,6 +85,14 @@ const dom = {
   sessionsTitle: document.getElementById("sessions-title"),
   sessionsSummary: document.getElementById("sessions-summary"),
   sessionsList: document.getElementById("sessions-list"),
+  uploadTitle: document.getElementById("upload-title"),
+  uploadHint: document.getElementById("upload-hint"),
+  uploadInput: document.getElementById("upload-input"),
+  uploadButton: document.getElementById("upload-button"),
+  uploadResult: document.getElementById("upload-result"),
+  commandsTitle: document.getElementById("commands-title"),
+  commandsSummary: document.getElementById("commands-summary"),
+  commandsBody: document.getElementById("commands-body"),
   toast: document.getElementById("toast"),
 };
 
@@ -178,6 +186,15 @@ function applyLabels() {
     "停用后其工具不再参与检索，也不会注入；状态会写回插件配置",
   );
   dom.sessionsTitle.textContent = t("pages.lazy-tools.sessions", "会话激活表");
+
+  dom.uploadTitle.textContent = t("pages.lazy-tools.upload", "上传子插件");
+  dom.uploadHint.textContent = t(
+    "pages.lazy-tools.upload_hint",
+    "支持单个 .py 或含 __init__.py 的 .zip 包；同名已存在时请先删除",
+  );
+  dom.uploadButton.textContent = t("pages.lazy-tools.install", "安装");
+
+  dom.commandsTitle.textContent = t("pages.lazy-tools.commands", "指令面板");
 }
 
 /* ------------------------------------------------------------------ */
@@ -299,6 +316,7 @@ function renderSources(sources, state) {
     meta.append(el("div", "source-name", source.name));
     const detail = [`${source.tools} 个工具`];
     if (source.error) detail.push(`加载失败：${source.error}`);
+    else if (source.retired) detail.push("已删除，工具已冻结不再注入");
     else if (!source.loaded) detail.push("未加载");
     else if (!source.enabled) detail.push("已停用");
     meta.append(el("div", "muted", detail.join(" · ")));
@@ -308,12 +326,23 @@ function renderSources(sources, state) {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = Boolean(source.enabled);
-    input.disabled = Boolean(state && state.enabled === false);
+    // 已退休的来源不允许在界面上重新启用：它的文件已经删了，
+    // 重新启用只会让工具从「冻结」变成「参与检索但检索不到」，徒增困惑。
+    input.disabled = Boolean(state && state.enabled === false) || Boolean(source.retired);
     input.addEventListener("change", () =>
       toggleSource(source.name, input.checked, input),
     );
     label.append(input, el("span", "slider"));
-    item.append(label);
+
+    const actions = el("div", "source-actions");
+    actions.append(label);
+    if (!source.retired) {
+      const del = el("button", "btn btn-small btn-danger", "删除");
+      del.type = "button";
+      del.addEventListener("click", () => deleteSubplugin(source.name));
+      actions.append(del);
+    }
+    item.append(actions);
 
     dom.sourcesList.append(item);
   }
@@ -481,6 +510,7 @@ async function loadState(force = false) {
       inputsInitialized = true;
     }
     if (!force) setBadge(t("pages.lazy-tools.synced", "已同步"), "ok");
+    await loadCommands();
   } catch (error) {
     showError(error?.message || String(error));
     setBadge(t("pages.lazy-tools.failed", "读取失败"), "danger");
@@ -547,12 +577,240 @@ async function toggleSource(name, enabled, input) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 子插件上传                                                          */
+/* ------------------------------------------------------------------ */
+
+async function uploadSubplugin() {
+  if (busy) return;
+  const file = dom.uploadInput.files?.[0];
+  if (!file) {
+    showToast("请先选择一个 .py 或 .zip 文件");
+    return;
+  }
+  setBusy(true);
+  clearError();
+  dom.uploadResult.textContent = `上传中：${file.name}（${file.size} 字节）…`;
+  try {
+    // bridge.upload 的字段名由 dashboard 固定为 file，后端也是按 file 取
+    const result = await unwrap(await bridge.upload("subplugins/upload", file));
+    dom.uploadResult.textContent = `已安装 ${result.name}（${result.tools} 个工具，索引 ${result.indexed} 条）`;
+    dom.uploadInput.value = "";
+    showToast(`子插件 ${result.name} 已安装`);
+    await loadState(true);
+  } catch (error) {
+    dom.uploadResult.textContent = "";
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteSubplugin(name) {
+  if (busy) return;
+  if (!window.confirm(`删除子插件 ${name}？它的工具会一并从注册表移除。`)) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("subplugins/delete", { name });
+    showToast(
+      `已删除 ${result.name}（文件${result.removed_files ? "已删除" : "不存在"}，工具 ${result.removed_tools} 个）`,
+    );
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 指令面板（AstrBot 官方 command_management 的薄前端）                 */
+/* ------------------------------------------------------------------ */
+
+async function loadCommands() {
+  clear(dom.commandsBody);
+  dom.commandsSummary.textContent = "";
+  let payload;
+  try {
+    payload = await callGet("commands");
+  } catch (error) {
+    dom.commandsBody.append(
+      el("div", "empty", `读取指令失败：${error?.message || error}`),
+    );
+    return;
+  }
+  if (!payload.supported) {
+    dom.commandsBody.append(el("div", "empty", payload.reason || "指令面板不可用。"));
+    return;
+  }
+
+  const commands = payload.commands || [];
+  const conflicts = payload.conflicts || [];
+  dom.commandsSummary.textContent = `${commands.length} 条指令${
+    conflicts.length ? ` · ${conflicts.length} 组冲突` : ""
+  }`;
+
+  if (conflicts.length) {
+    const box = el("div", "conflict-box");
+    box.append(el("div", "conflict-title", "指令名冲突"));
+    for (const group of conflicts) {
+      const names = (group.handlers || [])
+        .map((h) => `${h.plugin}:${h.current_name}`)
+        .join(" / ");
+      box.append(el("div", "muted", `${group.conflict_key} → ${names}`));
+    }
+    dom.commandsBody.append(box);
+  }
+
+  const wrap = el("div", "table-wrap");
+  const table = el("table", "table");
+  const thead = el("thead");
+  const head = el("tr");
+  for (const label of ["插件", "指令", "别名（逗号分隔）", "权限", "启用", ""]) {
+    head.append(el("th", "", label));
+  }
+  thead.append(head);
+  table.append(thead);
+
+  const tbody = el("tbody");
+  for (const cmd of commands) {
+    tbody.append(commandRow(cmd));
+  }
+  table.append(tbody);
+  wrap.append(table);
+  dom.commandsBody.append(wrap);
+}
+
+function commandRow(cmd) {
+  const row = el("tr");
+
+  const pluginCell = el("td", "muted");
+  pluginCell.append(el("div", "", cmd.plugin_display_name || cmd.plugin || ""));
+  if (cmd.has_conflict) pluginCell.append(el("span", "badge badge-danger", "冲突"));
+  if (cmd.reserved) pluginCell.append(el("span", "badge badge-neutral", "内置"));
+  row.append(pluginCell);
+
+  const nameCell = el("td");
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = cmd.current_fragment || "";
+  nameInput.className = "cmd-input";
+  nameInput.title = `原始指令：${cmd.original_command || ""}`;
+  nameInput.disabled = Boolean(cmd.reserved);
+  nameCell.append(nameInput);
+  row.append(nameCell);
+
+  const aliasCell = el("td");
+  const aliasInput = document.createElement("input");
+  aliasInput.type = "text";
+  aliasInput.value = (cmd.aliases || []).join(", ");
+  aliasInput.className = "cmd-input";
+  aliasInput.disabled = Boolean(cmd.reserved);
+  aliasCell.append(aliasInput);
+  row.append(aliasCell);
+
+  const permCell = el("td");
+  const permSelect = document.createElement("select");
+  permSelect.className = "cmd-select";
+  const options = [
+    ["", cmd.permission === "everyone" ? "默认（everyone）" : "保持不变"],
+    ["admin", "admin"],
+    ["member", "member"],
+  ];
+  for (const [value, label] of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    permSelect.append(option);
+  }
+  permSelect.value = "";
+  permSelect.addEventListener("change", async () => {
+    if (!permSelect.value) return;
+    const target = permSelect.value;
+    permSelect.disabled = true;
+    try {
+      await callPost("commands/permission", {
+        handler_full_name: cmd.handler_full_name,
+        permission: target,
+      });
+      showToast(`${cmd.effective_command} 权限已设为 ${target}`);
+      await loadCommands();
+    } catch (error) {
+      showError(error?.message || String(error));
+      permSelect.value = "";
+    } finally {
+      permSelect.disabled = false;
+    }
+  });
+  permCell.append(permSelect);
+  row.append(permCell);
+
+  const enabledCell = el("td");
+  const enabledInput = document.createElement("input");
+  enabledInput.type = "checkbox";
+  enabledInput.checked = Boolean(cmd.enabled);
+  enabledInput.disabled = Boolean(cmd.reserved);
+  enabledInput.addEventListener("change", async () => {
+    enabledInput.disabled = true;
+    try {
+      await callPost("commands/toggle", {
+        handler_full_name: cmd.handler_full_name,
+        enabled: enabledInput.checked,
+      });
+      showToast(`${cmd.effective_command} 已${enabledInput.checked ? "启用" : "停用"}`);
+    } catch (error) {
+      showError(error?.message || String(error));
+      enabledInput.checked = !enabledInput.checked;
+    } finally {
+      enabledInput.disabled = false;
+    }
+  });
+  enabledCell.append(enabledInput);
+  row.append(enabledCell);
+
+  const actionCell = el("td");
+  const save = el("button", "btn btn-small", "保存");
+  save.type = "button";
+  save.disabled = Boolean(cmd.reserved);
+  save.addEventListener("click", async () => {
+    const fragment = nameInput.value.trim();
+    if (!fragment) {
+      showToast("指令名不能为空");
+      return;
+    }
+    const aliases = aliasInput.value
+      .split(/[,，]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    save.disabled = true;
+    try {
+      await callPost("commands/rename", {
+        handler_full_name: cmd.handler_full_name,
+        fragment,
+        aliases,
+      });
+      showToast(`${cmd.original_command} 已更新`);
+      await loadCommands();
+    } catch (error) {
+      showError(error?.message || String(error));
+    } finally {
+      save.disabled = false;
+    }
+  });
+  actionCell.append(save);
+  row.append(actionCell);
+
+  return row;
+}
+
+/* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
 
 function bindEvents() {
   dom.refreshButton.addEventListener("click", () => loadState(false));
   dom.searchButton.addEventListener("click", runSearch);
+  dom.uploadButton.addEventListener("click", uploadSubplugin);
   dom.queryInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();

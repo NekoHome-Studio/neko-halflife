@@ -41,19 +41,29 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
 try:
-    from .core import injector
+    from .core import injector, uploads
     from .core.activation import ActivationStore
     from .core.models import RISK_HIGH, ToolMeta, TurnContext
     from .core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
     from .core.retriever import ToolIndex
     from .core.subplugins import SubPluginLoader
+    from .core.uploads import UploadError
 except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
-    from core import injector
+    from core import injector, uploads
     from core.activation import ActivationStore
     from core.models import RISK_HIGH, ToolMeta, TurnContext
     from core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
     from core.retriever import ToolIndex
     from core.subplugins import SubPluginLoader
+    from core.uploads import UploadError
+
+#: AstrBot 的指令管理 API。它是 core 的内部模块、不在 astrbot.api 里导出，
+#: 所以**必须容错导入**：拿不到就把指令面板降级成「此版本不支持」，
+#: 而不是让整个插件加载失败。
+try:
+    from astrbot.core.star import command_management
+except Exception:  # noqa: BLE001 - 不同 AstrBot 版本该路径可能变化
+    command_management = None
 
 __all__ = ["LazyToolsPlugin", "lazy_tool"]
 
@@ -401,6 +411,12 @@ class LazyToolsPlugin(Star):
             ("search", self.page_search, ["POST"], "试跑本地检索"),
             ("sessions/clear", self.page_clear_session, ["POST"], "清空指定会话的激活表"),
             ("sources/toggle", self.page_toggle_source, ["POST"], "启用或停用子插件"),
+            ("subplugins/upload", self.page_upload_subplugin, ["POST"], "上传并安装子插件"),
+            ("subplugins/delete", self.page_delete_subplugin, ["POST"], "删除子插件"),
+            ("commands", self.page_commands, ["GET"], "列出指令及其别名/权限/启停"),
+            ("commands/rename", self.page_rename_command, ["POST"], "重命名指令或改别名"),
+            ("commands/toggle", self.page_toggle_command, ["POST"], "启用或停用指令"),
+            ("commands/permission", self.page_set_command_permission, ["POST"], "设置指令权限"),
         )
         for suffix, handler, methods, description in routes:
             try:
@@ -424,6 +440,7 @@ class LazyToolsPlugin(Star):
                 "enabled": REGISTRY.is_source_enabled(name),
                 "tools": counts.get(name, 0),
                 "loaded": name in self.loader.loaded,
+                "retired": REGISTRY.is_source_retired(name),
                 "error": self.loader.errors.get(name),
             }
             for name in sorted(set(counts) | set(self.loader.discover()))
@@ -585,6 +602,275 @@ class LazyToolsPlugin(Star):
             }
         )
 
+    async def page_upload_subplugin(self):
+        """接收并安装一个子插件包。
+
+        表单字段名固定为 ``file``（bridge 的 ``upload()`` 只发文件，不带别的参数，
+        所以「覆盖」必须在页面上拆成「先删除再上传」两步）。
+
+        **这是本插件唯一会写入代码并在进程内执行它的入口**，因此：
+        只允许管理员（Page 本身在 dashboard 登录后才可达）、文件名与包结构严格校验、
+        体积上限、已存在则拒绝覆盖。校验全部通过后才落盘。
+        """
+        if not self._allow_upload:
+            return error_response(
+                "未启用子插件上传。请在插件配置里打开「允许上传子插件」——"
+                "上传的子插件会在 AstrBot 进程内执行其中的 Python 代码，"
+                "因此默认不开放。"
+            )
+
+        files = await request.files()
+        upload = files.get("file")
+        filename = str(getattr(upload, "filename", "") or "")
+        if upload is None or not filename:
+            return error_response("没有收到文件（表单字段名必须是 file）。")
+
+        try:
+            name = uploads.sanitize_subplugin_name(filename)
+        except UploadError as exc:
+            return error_response(str(exc))
+
+        max_bytes = self._max_upload_bytes
+        declared = getattr(upload, "content_length", None)
+        if max_bytes and declared and declared > max_bytes:
+            return error_response(
+                f"文件过大：{declared} 字节，超过上限 {max_bytes} 字节。"
+            )
+
+        is_zip = filename.lower().endswith(".zip")
+        staging_dir = self.loader.root / ".uploads"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged = staging_dir / (f"{name}.zip" if is_zip else f"{name}.py")
+
+        try:
+            await upload.save(staged)
+            size = staged.stat().st_size
+            if max_bytes and size > max_bytes:
+                return error_response(
+                    f"文件过大：{size} 字节，超过上限 {max_bytes} 字节。"
+                )
+            if is_zip:
+                dest = uploads.install_zip_package(
+                    staged, self.loader.root, name, max_total_bytes=max_bytes
+                )
+            else:
+                dest = uploads.install_py_file(staged, self.loader.root, name)
+        except UploadError as exc:
+            return error_response(str(exc))
+        except Exception as exc:  # noqa: BLE001 - 安装失败要变成可读错误，而不是 500
+            logger.error("[neko-halflife] 子插件安装失败：%s", exc, exc_info=True)
+            return error_response(f"安装失败：{exc}")
+        finally:
+            staged.unlink(missing_ok=True)
+
+        # 落盘之后才导入并执行——这一步才会真正跑子插件里的代码
+        loaded = self.loader.load(name)
+        self.loader.set_enabled(name, True)
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
+        self._persist_sub_plugins()
+
+        installed = len([m for m in REGISTRY.all() if m.source == name])
+        logger.warning(
+            "[neko-halflife] 已通过 WebUI 安装子插件 %s（%s，%d 个工具，导入%s）",
+            name,
+            dest,
+            installed,
+            "成功" if loaded else f"失败：{self.loader.errors.get(name, '未知原因')}",
+        )
+        if not loaded:
+            return error_response(
+                f"子插件 {name} 已写入 {dest}，但导入失败："
+                f"{self.loader.errors.get(name, '未知原因')}。请修正后重载插件。"
+            )
+        return json_response(
+            {
+                "name": name,
+                "path": str(dest),
+                "tools": installed,
+                "indexed": self.index.size,
+                "kind": "zip" if is_zip else "single_file",
+            }
+        )
+
+    async def page_delete_subplugin(self):
+        """删除一个子插件（单文件或目录），并清理它的工具注册。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        raw = str(payload.get("name") or "").strip()
+        if not raw:
+            return error_response("请提供 name。")
+        try:
+            name = uploads.sanitize_subplugin_name(raw)
+        except UploadError as exc:
+            return error_response(str(exc))
+
+        removed_tools = self._forget_source_tools(name)
+        removed_files = uploads.remove_subplugin(self.loader.root, name)
+        self.loader.loaded.discard(name)
+        self.loader.errors.pop(name, None)
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
+        self._persist_sub_plugins()
+
+        if not removed_files and not removed_tools:
+            return error_response(f"没有找到子插件 {name}。", status_code=404)
+        logger.warning(
+            "[neko-halflife] 已删除子插件 %s（文件=%s，工具 %d 个）",
+            name,
+            "已删除" if removed_files else "不存在",
+            removed_tools,
+        )
+        return json_response(
+            {
+                "name": name,
+                "removed_files": removed_files,
+                "removed_tools": removed_tools,
+                "indexed": self.index.size,
+            }
+        )
+
+    # ---- 指令面板：AstrBot 官方 command_management 的薄前端 ----------------
+
+    def _command_panel_unavailable(self) -> str:
+        """返回不可用原因；可用时返回空串。"""
+        if not self._cmd_panel_enabled:
+            return (
+                "指令面板未启用。它是 AstrBot 的通用管理功能、与本插件主题无关，"
+                "为保持插件定位清晰默认关闭；需要时在插件配置里打开"
+                "「启用指令面板」。"
+            )
+        if command_management is None:
+            return (
+                "当前 AstrBot 版本未提供 astrbot.core.star.command_management，"
+                "指令面板不可用（插件其余功能不受影响）。"
+            )
+        return ""
+
+    async def page_commands(self):
+        """列出全部指令及其别名、权限、启停状态与冲突。"""
+        reason = self._command_panel_unavailable()
+        if reason:
+            return json_response({"supported": False, "reason": reason, "commands": []})
+        try:
+            commands = await command_management.list_commands()
+            conflicts = await command_management.list_command_conflicts()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[neko-halflife] 读取指令列表失败：%s", exc, exc_info=True)
+            return error_response(f"读取指令列表失败：{exc}")
+        return json_response(
+            {
+                "supported": True,
+                "reason": "",
+                "commands": commands,
+                "conflicts": conflicts,
+            }
+        )
+
+    async def _command_payload(self) -> tuple[dict[str, Any] | None, Any]:
+        """读取并校验指令操作的公共字段。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return None, error_response("请求体必须是 JSON 对象。")
+        full_name = str(payload.get("handler_full_name") or "").strip()
+        if not full_name:
+            return None, error_response("请提供 handler_full_name。")
+        return payload, None
+
+    async def page_rename_command(self):
+        """重命名指令或修改别名（自带冲突校验）。"""
+        reason = self._command_panel_unavailable()
+        if reason:
+            return error_response(reason)
+        payload, bad = await self._command_payload()
+        if bad is not None:
+            return bad
+        fragment = str(payload.get("fragment") or "").strip()
+        if not fragment:
+            return error_response("请提供新的指令名 fragment。")
+        raw_aliases = payload.get("aliases")
+        aliases = (
+            [str(a).strip() for a in raw_aliases if str(a).strip()]
+            if isinstance(raw_aliases, list)
+            else None
+        )
+        try:
+            descriptor = await command_management.rename_command(
+                str(payload["handler_full_name"]), fragment, aliases
+            )
+        except ValueError as exc:  # 重名/空名等可预期错误
+            return error_response(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[neko-halflife] 重命名指令失败：%s", exc, exc_info=True)
+            return error_response(f"重命名失败：{exc}")
+        return json_response(
+            {
+                "handler_full_name": descriptor.handler_full_name,
+                "effective_command": descriptor.effective_command,
+                "aliases": descriptor.aliases,
+            }
+        )
+
+    async def page_toggle_command(self):
+        """启用或停用指令。"""
+        reason = self._command_panel_unavailable()
+        if reason:
+            return error_response(reason)
+        payload, bad = await self._command_payload()
+        if bad is not None:
+            return bad
+        enabled = bool(payload.get("enabled"))
+        try:
+            descriptor = await command_management.toggle_command(
+                str(payload["handler_full_name"]), enabled
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[neko-halflife] 启停指令失败：%s", exc, exc_info=True)
+            return error_response(f"启停失败：{exc}")
+        return json_response(
+            {
+                "handler_full_name": descriptor.handler_full_name,
+                "enabled": descriptor.enabled,
+            }
+        )
+
+    async def page_set_command_permission(self):
+        """设置指令权限（admin / member）。
+
+        注意 ``update_command_permission`` 的第二个形参名是 ``permission_type``
+        而不是 ``permission``，所以这里**按位置传参**，避免关键字名变化导致 TypeError。
+        """
+        reason = self._command_panel_unavailable()
+        if reason:
+            return error_response(reason)
+        payload, bad = await self._command_payload()
+        if bad is not None:
+            return bad
+        permission = str(payload.get("permission") or "").strip().lower()
+        if permission not in {"admin", "member"}:
+            return error_response(
+                "权限只能是 admin 或 member（AstrBot 不接受 everyone；"
+                "要恢复默认请重新加载插件）。"
+            )
+        try:
+            descriptor = await command_management.update_command_permission(
+                str(payload["handler_full_name"]), permission
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[neko-halflife] 设置指令权限失败：%s", exc, exc_info=True)
+            return error_response(f"设置权限失败：{exc}")
+        return json_response(
+            {
+                "handler_full_name": descriptor.handler_full_name,
+                "permission": descriptor.permission,
+            }
+        )
+
     # ------------------------------------------------------------------
     # 内部工具方法
     # ------------------------------------------------------------------
@@ -601,6 +887,11 @@ class LazyToolsPlugin(Star):
         self._allow_high_risk = bool(get("allow_high_risk_auto", False))
         self._meta_enabled = bool(get("meta_tools_enabled", True))
         self._sub_disabled = list(get("sub_plugins_disabled", []) or [])
+        self._allow_upload = bool(get("allow_subplugin_upload", True))
+        self._max_upload_bytes = (
+            max(int(get("max_subplugin_upload_kb", 2048) or 0), 0) * 1024
+        )
+        self._cmd_panel_enabled = bool(get("enable_command_panel", False))
         self._debug = bool(get("debug", False))
         self._search_top_k = max(self._top_k, 5) if self._top_k else 5
 
@@ -622,6 +913,64 @@ class LazyToolsPlugin(Star):
                     name,
                     self.loader.errors.get(name, "未知原因"),
                 )
+        # 注册表里还留着、但目录已经不在的子插件：把它们的工具一并清干净。
+        for stale in sorted(set(REGISTRY.sources()) - set(result)):
+            removed = self._forget_source_tools(stale)
+            self.loader.loaded.discard(stale)
+            logger.info(
+                "[neko-halflife] 子插件 %s 的目录已不存在，清理其 %d 个工具",
+                stale,
+                removed,
+            )
+
+    def _forget_source_tools(self, source: str) -> int:
+        """移除某个来源的全部工具，并保证它们**再也不会被注入**。
+
+        这里有个很隐蔽的坑：``injector.plan_pruning`` 把「本插件注册表里查不到」
+        当作「不是本插件的工具」而**原样保留**。所以如果只从注册表里删掉定义、
+        而工具仍留在 AstrBot 全局 ``llm_tools`` 里，结果恰好相反——
+        删掉的子插件反而变成每轮都注入。
+
+        因此分两种情况：
+        * 全局表移除**全部成功** → 遗忘定义（干净，界面上也不再显示）；
+        * 有任何工具没能移除（取不到 llm_tools、或移除抛错）→ **退休**该来源：
+          保留定义以便被识别为「本插件的工具」，但永远不进保留集，每轮必被裁掉。
+        """
+        metas = [meta for meta in REGISTRY.all() if meta.source == source]
+        if not metas:
+            return 0
+
+        manager = None
+        try:
+            manager = self.context.get_llm_tool_manager()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[neko-halflife] 取 llm_tools 失败：%s", exc)
+
+        still_registered: list[str] = []
+        if manager is None:
+            still_registered = [meta.name for meta in metas]
+        else:
+            for meta in metas:
+                try:
+                    manager.remove_func(meta.name)
+                except Exception as exc:  # noqa: BLE001
+                    still_registered.append(meta.name)
+                    logger.warning(
+                        "[neko-halflife] 从 AstrBot 全局工具表移除 %s 失败：%s",
+                        meta.name,
+                        exc,
+                    )
+
+        if still_registered:
+            retired = REGISTRY.retire_source(source)
+            logger.warning(
+                "[neko-halflife] 有 %d 个工具未能从全局表移除，已退休来源 %s 以确保不再注入：%s",
+                len(still_registered),
+                source,
+                ", ".join(still_registered),
+            )
+            return retired
+        return REGISTRY.forget_source(source)
 
     def _rebuild_index(self) -> None:
         self.index.build(REGISTRY.candidates())

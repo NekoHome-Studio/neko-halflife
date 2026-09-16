@@ -182,8 +182,8 @@ sub_plugins/
 
 ### 5. WebUI 面板（Pages）
 
-插件在 AstrBot WebUI 的插件详情页里提供一个 **懒加载工具** 面板
-（`pages/lazy-tools/`），能做四件事：
+插件在 AstrBot WebUI 的插件详情页里提供一个 **薛定谔的工具箱** 面板
+（`pages/lazy-tools/`），能做这些事：
 
 * **状态总览**：注册工具数、常驻元工具数、索引条目、活跃会话、当前激活总数、过期策略；
 * **检索试跑**（最实用的一块）：输入一句用户可能会说的话，直接看到召回候选、
@@ -195,7 +195,9 @@ sub_plugins/
   比改配置→发消息→翻日志快得多；
 * **工具清单**：名称、来源（`main` 还是某个子插件）、标签、存活策略、风险等级、描述；
 * **会话激活表**：按 UMO 列出每个会话当前激活了哪些工具、还剩几轮/几秒，可单独清空；
-* **子插件开关**：在线启停 `sub_plugins/` 下的工具集，状态会写回插件配置。
+* **子插件开关**：在线启停 `sub_plugins/` 下的工具集，状态会写回插件配置；
+* **上传子插件**：上传一个 `.py` 或 `.zip` 直接装进 `sub_plugins/` 并立即加载；
+* **指令面板**（默认关闭）：列出全部指令，支持改指令名/别名、启停、权限、冲突查看。
 
 页面通过 `window.AstrBotPluginPage` bridge 与 WebUI 外壳通信，主题跟随 WebUI
 的明暗切换，文案走 `.astrbot-plugin/i18n/`（zh-CN / en-US）。
@@ -204,6 +206,50 @@ sub_plugins/
 > 因此不能 fetch、不能用 localStorage、拿不到 dashboard cookie——所有请求都必须
 > 走 bridge。新增接口时记得后端路由要带插件名前缀
 > （`/{PLUGIN_NAME}/xxx`），而页面里 `bridge.apiGet("xxx")` **不带**前缀。
+
+#### 上传子插件
+
+支持两种包：
+
+* **单文件** `my_tools.py` → 装成 `sub_plugins/my_tools.py`；
+* **包** `my_tools.zip` → 装成 `sub_plugins/my_tools/`，要求根目录有 `__init__.py`
+  （整体套一层目录也认，会自动剥掉）。
+
+子插件名会做白名单校验：必须是**合法 Python 标识符**（字母开头，后接字母/数字/下划线），
+因为加载器要拿它构造模块名。不能以 `_` 或 `.` 开头——加载器会跳过这类条目，
+否则会出现「上传成功但永远不加载」的静默失败。
+
+> **⚠️ 安全边界**：上传的子插件会在 AstrBot 进程内**执行其中的 Python 代码**，
+> 权限与 AstrBot 本身相同。这是本插件唯一会写入并执行代码的入口。威胁模型上，
+> 能打开这个面板的人已经是 dashboard 管理员（本来就能装插件），能力是等价的；
+> 但仍建议只上传自己信任的包。可用 `allow_subplugin_upload` 关掉该接口。
+>
+> 实现的防护：名字白名单、**落盘前**先校验压缩包全部成员（路径穿越 / 符号链接 /
+> 压缩炸弹 / 条目数上限）、写入时按实际字节数二次限流、解压目标用 `resolve()`
+> 复核仍在目标目录内、失败时清理不留半个子插件。`tests/selftest.py` 里有针对
+> zip-slip 的对抗性测试，断言攻击包**写不出任何文件**。
+
+删除子插件时，工具需要从**两处**移除：本插件注册表，以及 AstrBot 的全局
+`llm_tools`。只清前者会造成一个很隐蔽的反向错误——工具仍留在全局表里，而插件
+已不认识它们，裁剪逻辑会把「不认识」当成「不是本插件的工具」而**原样保留**，
+于是删掉的东西反而变成每轮都注入。若全局移除失败，插件会退而把该来源标记为
+「已退休」：保留定义以便仍被识别为本插件的工具，但永不进入保留集，保证每轮被裁掉。
+
+#### 指令面板
+
+它是对 AstrBot 官方 `astrbot.core.star.command_management` 的**薄前端**，
+不另造存储：改名/启停写 AstrBot 的指令配置表，权限写 `alter_cmd` 偏好，
+并同步修改运行时过滤器。因此与 dashboard 自带的「指令管理」**数据同源、互不冲突**，
+改了哪边都能看到。
+
+因为它是 AstrBot 的通用管理功能、与本插件「懒加载工具」的主题无关，
+为保持插件定位清晰**默认关闭**（`enable_command_panel`）。另外它属于 AstrBot 的
+core 内部模块而非 `astrbot.api` 公开接口，所以采用**容错导入**：拿不到就把面板
+降级成「此版本不支持」，不影响插件其它功能。
+
+> 接口细节：`update_command_permission` 的第二个形参名是 `permission_type`
+> 而不是 `permission`，且只接受 `admin` / `member`（`everyone` 会被拒），
+> 所以插件按位置传参并预先校验取值。
 
 ---
 
@@ -223,6 +269,9 @@ sub_plugins/
 | `max_result_chars` | 4000 | 工具结果统一裁剪长度 |
 | `allow_high_risk_auto` | false | 是否允许预检索自动激活 `risk="high"` 工具 |
 | `sub_plugins_disabled` | `[]` | **停用**的子插件，空 = 全部启用 |
+| `allow_subplugin_upload` | true | 允许 WebUI 上传子插件。会在进程内执行上传包里的 Python，管理员能力等价，可关掉 |
+| `max_subplugin_upload_kb` | 2048 | 上传体积上限（压缩包与解压后都限） |
+| `enable_command_panel` | false | 指令面板。AstrBot 通用管理功能、与本插件主题无关，默认关闭 |
 
 > `sub_plugins_disabled` 存的是停用名单而不是启用名单：启用名单里的空列表无法
 > 区分「一个都不启用」和「留空 = 全部启用」，会把「全停」静默变成「全开」。
@@ -316,21 +365,27 @@ req.func_tool = 许可池中 (非本插件工具 ∪ keep)
 两层测试，都不需要启动 AstrBot：
 
 ```bash
-# 1) 纯逻辑自检：检索打分、双过期、裁剪安全性（无依赖，49 项）
+# 1) 纯逻辑自检：检索打分、双过期、裁剪与上传安全（无依赖，91 项）
 python tests/selftest.py
 
-# 2) 集成冒烟：在真实 AstrBot 源码环境里验证注册契约与 Web API（87 项）
+# 2) 集成冒烟：在真实 AstrBot 源码环境里验证注册契约与全部 Web API（132 项）
 #    需要能 import astrbot；用 ASTRBOT_SRC 指定源码根目录
 #    （刻意不用 ASTRBOT_ROOT——那是 AstrBot 自己的运行根目录变量）
 python tests/smoke_astrbot.py
 ```
 
-`tests/selftest.py` 里最重要的是 `test_pruning_never_exceeds_pool`：
-它构造「激活表里有两个工具、许可池里只有一个」的场景，
-断言最终请求里绝不会出现许可池之外的工具。
+`tests/selftest.py` 里最重要的两项都是**对抗性**的：
+
+* `test_pruning_never_exceeds_pool` 构造「激活表里有两个工具、许可池里只有一个」
+  的场景，断言最终请求里绝不会出现许可池之外的工具；
+* `test_install_roundtrip` 构造一个含 `../pwned.txt` 成员的 zip-slip 攻击包，
+  断言它被拒绝、**且没有写出任何文件**、也没留下半个子插件。
 
 `tests/smoke_astrbot.py` 会真的导入 AstrBot、真的构造 `ToolSet` 与 `FunctionTool`、
-真的跑一遍 `_decide()` 和四个 Page 接口，并校验 Page 目录与 i18n 文件齐备。
+真的跑一遍 `_decide()` 和全部 10 个 Page 接口，并校验 Page 目录与 i18n 文件齐备。
+其中「上传 → 删除」那一段用 scratch 目录当 `sub_plugins/`（不污染仓库），
+并覆盖两条删除路径：能清全局工具表时彻底遗忘；清不掉时退休兜底，
+断言两种情况下的工具**都不会**再被注入。
 它把 AstrBot 的 `data/` 重定向到插件目录内的临时目录（已 gitignore），跑完自动删除。
 
 ---
@@ -352,7 +407,7 @@ python tests/smoke_astrbot.py
 
 | AstrBot | 核对方式 | 结果 |
 |---|---|---|
-| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与 4 个 Page 接口），148 项断言全绿 | 全部成立 |
+| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与全部 10 个 Page 接口），223 项断言全绿 | 全部成立 |
 | **4.27.4** | 按上面五条逐条比对 tag `v4.27.4` 源码 | 全部成立 |
 
 4.27.4 的差异都落在本插件不依赖的地方：provider 选择改为 `get_using_provider_async`、

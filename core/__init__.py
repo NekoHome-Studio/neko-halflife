@@ -9,6 +9,7 @@
 * :mod:`core.activation`  —— per-UMO 激活表与轮次/时间双过期
 * :mod:`core.injector`    —— 许可池快照与 ToolSet 重建（安全关键）
 * :mod:`core.subplugins`  —— sub_plugins/ 目录下的私有工具集加载
+* :mod:`core.uploads`     —— 子插件上传的校验与落盘（安全关键）
 """
 
 from __future__ import annotations
@@ -20,4 +21,5 @@ __all__ = [
     "registry",
     "retriever",
     "subplugins",
+    "uploads",
 ]

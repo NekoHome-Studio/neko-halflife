@@ -144,11 +144,10 @@ class SubPluginLoader:
             if not ok:
                 continue
             self.registry.set_source_enabled(name, name not in off)
-        # 注册表里存在但目录已消失的子插件：直接清掉，避免残留不可见工具。
-        for stale in self.registry.sources():
-            if stale not in result:
-                self.registry.forget_source(stale)
-                logger.info("[neko-halflife] 子插件 %s 已移除", stale)
+        # 注意：这里**不**清理「注册表里有、目录已消失」的来源。
+        # 只从本插件注册表移除是不够的——那些工具仍在 AstrBot 全局 llm_tools 里，
+        # 而插件已不认识它们，会被当成「别人的工具」原样注入。清理需要同时动全局表，
+        # 所以交给调用方（LazyToolsPlugin._load_sub_plugins）处理。
         return result
 
     def set_enabled(self, name: str, enabled: bool) -> bool:

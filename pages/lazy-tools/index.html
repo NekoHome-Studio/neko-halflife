@@ -87,6 +87,28 @@
         </div>
         <div id="sessions-list" class="sessions"></div>
       </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="upload-title">上传子插件</h2>
+          <span class="muted" id="upload-hint"></span>
+        </div>
+        <div class="playground-controls">
+          <input id="upload-input" type="file" accept=".py,.zip" />
+          <button id="upload-button" type="button" class="btn btn-primary">
+            安装
+          </button>
+        </div>
+        <div id="upload-result" class="upload-result"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="commands-title">指令面板</h2>
+          <span class="muted" id="commands-summary"></span>
+        </div>
+        <div id="commands-body"></div>
+      </section>
     </div>
 
     <div id="toast" class="toast" hidden></div>

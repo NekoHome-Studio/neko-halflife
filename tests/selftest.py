@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
 """纯逻辑自检：不依赖 AstrBot，直接 ``python tests/selftest.py`` 运行。
 
-覆盖检索打分、双过期、以及**安全关键的裁剪逻辑**。最后一项最重要：
-任何情况下都不能把「上游许可池之外」的工具塞进请求。
+覆盖检索打分、双过期、裁剪安全性，以及子插件上传的校验。
+最重要的两项是**对抗性**的：``test_pruning_never_exceeds_pool`` 保证不会把
+上游许可池之外的工具塞进请求；``test_install_roundtrip`` 保证 zip-slip
+攻击写不出任何文件。
 """
 
 from __future__ import annotations
 
 import sys
+import zipfile
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+from core import injector, uploads  # noqa: E402
 from core.activation import ActivationStore  # noqa: E402
-from core import injector  # noqa: E402
 from core.models import RISK_HIGH, ToolMeta  # noqa: E402
 from core.registry import ToolRegistry  # noqa: E402
 from core.retriever import ToolIndex, tokenize  # noqa: E402
+from core.uploads import UploadError  # noqa: E402
 
 _PASSED = 0
 _FAILED: list[str] = []
@@ -289,6 +293,199 @@ def test_high_risk_flag() -> None:
     check(meta("safe").risk == "normal", "默认为普通风险")
 
 
+# ----------------------------------------------------------------------
+# 6. 子插件上传校验（安全关键）
+# ----------------------------------------------------------------------
+
+
+def _expect_upload_error(fn, label: str) -> None:
+    try:
+        fn()
+    except UploadError as exc:
+        check(True, f"{label} → 已拒绝（{str(exc)[:36]}…）")
+    except Exception as exc:  # noqa: BLE001
+        check(False, f"{label} → 抛出了非 UploadError：{type(exc).__name__}: {exc}")
+    else:
+        check(False, f"{label} → 竟然通过了")
+
+
+def test_sanitize_name() -> None:
+    print("uploads / 子插件名白名单")
+    check(uploads.sanitize_subplugin_name("demo_tools.py") == "demo_tools", "接受 .py")
+    check(uploads.sanitize_subplugin_name("weather.zip") == "weather", "接受 .zip")
+    check(uploads.sanitize_subplugin_name("plain") == "plain", "接受无扩展名")
+    check(
+        uploads.sanitize_subplugin_name("dir/sub/name.py") == "name",
+        "只取最后一段，挡住伪路径",
+    )
+    check(
+        uploads.sanitize_subplugin_name("C:\\evil\\name.py") == "name",
+        "反斜杠路径同样只取最后一段",
+    )
+
+    for bad, why in (
+        ("_hidden.py", "下划线开头（加载器会跳过）"),
+        (".secret.py", "点号开头（加载器会跳过）"),
+        ("my-pack.py", "含连字符（不是合法模块名）"),
+        ("class.py", "Python 关键字"),
+        ("1abc.py", "数字开头"),
+        ("", "空名字"),
+        ("a" * 80 + ".py", "超长"),
+    ):
+        _expect_upload_error(
+            lambda b=bad: uploads.sanitize_subplugin_name(b), why
+        )
+
+    # 关键不变量：合法名字必须是合法 Python 标识符，否则加载器构造模块名会出问题
+    ok = all(
+        uploads.sanitize_subplugin_name(f"{n}.py").isidentifier()
+        for n in ("a", "abc_1", "X9")
+    )
+    check(ok, "通过校验的名字一定是合法 Python 标识符")
+
+
+def test_zip_member_safety() -> None:
+    print("uploads / zip 成员名安全")
+    for good in ("a.py", "pkg/__init__.py", "pkg/sub/mod.py", "./a.py"):
+        check(uploads.is_safe_zip_member(good), f"放行 {good}")
+    for bad in ("../evil.py", "pkg/../../evil.py", "/abs.py", "C:/abs.py", "a\\..\\b.py"):
+        check(not uploads.is_safe_zip_member(bad), f"拦截 {bad}")
+
+
+def test_package_root_detection() -> None:
+    print("uploads / 包根识别")
+    check(uploads.detect_package_root(["__init__.py", "a.py"]) == "", "根布局")
+    check(
+        uploads.detect_package_root(["my_pack/__init__.py", "my_pack/a.py"]) == "my_pack",
+        "单层包装（GitHub zip 常见）",
+    )
+    _expect_upload_error(
+        lambda: uploads.detect_package_root(["a.py", "b.py"]), "没有 __init__.py"
+    )
+    _expect_upload_error(
+        lambda: uploads.detect_package_root(
+            ["x/__init__.py", "y/__init__.py"]
+        ),
+        "两个候选包根，无法判断",
+    )
+
+
+def test_zip_plan_rejects() -> None:
+    print("uploads / 落盘前校验")
+
+    def info(name: str, size: int = 10, mode: int = 0o100644) -> zipfile.ZipInfo:
+        item = zipfile.ZipInfo(name)
+        item.file_size = size
+        item.external_attr = mode << 16
+        return item
+
+    check(
+        uploads.plan_zip_upload(
+            [info("__init__.py"), info("a.py")], max_total_bytes=1000
+        )
+        == "",
+        "正常包通过校验并返回根前缀",
+    )
+    _expect_upload_error(
+        lambda: uploads.plan_zip_upload(
+            [info("../evil/__init__.py")], max_total_bytes=1000
+        ),
+        "含 ../ 的成员",
+    )
+    _expect_upload_error(
+        lambda: uploads.plan_zip_upload(
+            [info("__init__.py"), info("big.bin", size=99999)], max_total_bytes=1000
+        ),
+        "自报体积超限（压缩炸弹）",
+    )
+    _expect_upload_error(
+        lambda: uploads.plan_zip_upload([], max_total_bytes=1000), "空包"
+    )
+    _expect_upload_error(
+        lambda: uploads.plan_zip_upload(
+            [info(f"f{i}.py") for i in range(uploads.MAX_ENTRIES + 1)],
+            max_total_bytes=10**9,
+        ),
+        "条目数超限",
+    )
+    # 符号链接：Unix 权限位为 0o120777
+    _expect_upload_error(
+        lambda: uploads.plan_zip_upload(
+            [info("__init__.py"), info("link", mode=0o120777)], max_total_bytes=1000
+        ),
+        "含符号链接成员",
+    )
+
+
+def test_install_roundtrip() -> None:
+    print("uploads / 真实安装与删除（含 zip-slip 攻击）")
+    import shutil
+
+    # 刻意用插件目录内的 scratch，而不是系统临时目录：某些受限环境（含本项目的
+    # 开发沙箱）不允许在系统 temp 下创建/删除目录，用 tempdir 会让测试本身失败。
+    scratch = PLUGIN_ROOT / ".selftest-scratch"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+
+    try:
+        _install_roundtrip_body(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _install_roundtrip_body(raw: Path) -> None:
+    root = raw / "sub_plugins"
+    root.mkdir()
+
+    # 1) 单文件安装
+    src_py = raw / "demo.py"
+    src_py.write_text("x = 1\n", encoding="utf-8")
+    dest = uploads.install_py_file(src_py, root, "demo")
+    check(dest.is_file() and dest.name == "demo.py", "单文件子插件安装成功")
+    _expect_upload_error(
+        lambda: uploads.install_py_file(src_py, root, "demo"), "重复安装被拒"
+    )
+    check(uploads.remove_subplugin(root, "demo"), "单文件可删除")
+    check(not dest.exists(), "删除后文件消失")
+
+    # 2) 正常 zip 包安装（带一层包装目录）
+    good_zip = raw / "pack.zip"
+    with zipfile.ZipFile(good_zip, "w") as archive:
+        archive.writestr("my_pack/__init__.py", "y = 2\n")
+        archive.writestr("my_pack/helper.py", "z = 3\n")
+    dest = uploads.install_zip_package(
+        good_zip, root, "my_pack", max_total_bytes=10**7
+    )
+    check(
+        (dest / "__init__.py").is_file() and (dest / "helper.py").is_file(),
+        "zip 包子插件安装成功且剥掉了包装目录",
+    )
+    check(uploads.remove_subplugin(root, "my_pack"), "zip 子插件可删除")
+
+    # 3) zip-slip 攻击：成员试图写到 sub_plugins 之外
+    evil_zip = raw / "evil.zip"
+    with zipfile.ZipFile(evil_zip, "w") as archive:
+        archive.writestr("__init__.py", "ok\n")
+        archive.writestr("../pwned.txt", "owned\n")
+    _expect_upload_error(
+        lambda: uploads.install_zip_package(
+            evil_zip, root, "evil", max_total_bytes=10**7
+        ),
+        "zip-slip 成员",
+    )
+    check(not (raw / "pwned.txt").exists(), "zip-slip 没有写出任何文件")
+    check(not (root / "evil").exists(), "失败的安装没有留下半个子插件")
+
+    # 4) 不是 zip 的文件
+    _expect_upload_error(
+        lambda: uploads.install_zip_package(
+            src_py, root, "notzip", max_total_bytes=10**7
+        ),
+        "非 zip 文件",
+    )
+
+
 def main() -> int:
     for test in (
         test_tokenize,
@@ -303,6 +500,11 @@ def main() -> int:
         test_registry_sources,
         test_keep_set_meta_toggle,
         test_high_risk_flag,
+        test_sanitize_name,
+        test_zip_member_safety,
+        test_package_root_detection,
+        test_zip_plan_rejects,
+        test_install_roundtrip,
     ):
         test()
         print()

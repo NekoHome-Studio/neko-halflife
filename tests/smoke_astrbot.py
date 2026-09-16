@@ -329,12 +329,31 @@ def main() -> int:
         "所有路由都带插件名前缀（前端 endpoint 不带，由 dashboard 拼接）",
     )
 
+    class _Files(dict):
+        """模拟 PluginMultiDict：只需要 .get()。"""
+
     class FakeWebRequest:
-        def __init__(self, payload=None):
+        def __init__(self, payload=None, files=None):
             self.payload = payload or {}
+            self._files = _Files(files or {})
 
         async def json(self, default=None):
             return self.payload
+
+        async def files(self):
+            return self._files
+
+    class FakeUpload:
+        """模拟 astrbot.api.web.PluginUploadFile。"""
+
+        def __init__(self, filename, data: bytes):
+            self.filename = filename
+            self.content_type = "application/octet-stream"
+            self.content_length = len(data)
+            self._data = data
+
+        async def save(self, destination):
+            Path(destination).write_bytes(self._data)
 
     def body_of(response) -> dict:
         return json.loads(bytes(response.body).decode("utf-8"))
@@ -490,6 +509,284 @@ def main() -> int:
         if path.suffix == ".py"
     )
     check(prefix_hits >= 10, f"新日志前缀 [neko-halflife] 实际出现 {prefix_hits} 处")
+
+    print()
+    print("14. 子插件上传与指令面板")
+
+    # 用 scratch 目录当 sub_plugins，避免测试往仓库里写文件
+    scratch = PLUGIN_ROOT / ".selftest-scratch"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+    real_loader_root = plugin.loader.root
+    real_cmd_mgmt = plugin_main.command_management
+    plugin.loader.root = scratch
+    try:
+        registered2: list[tuple[str, list[str]]] = []
+
+        class FakeContext2:
+            def register_web_api(self, route, handler, methods, description):
+                registered2.append((route, list(methods)))
+
+        plugin.context = FakeContext2()
+        plugin._register_web_apis()
+        routes2 = dict(registered2)
+        for suffix, method in (
+            ("subplugins/upload", "POST"),
+            ("subplugins/delete", "POST"),
+            ("commands", "GET"),
+            ("commands/rename", "POST"),
+            ("commands/toggle", "POST"),
+            ("commands/permission", "POST"),
+        ):
+            route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+            check(routes2.get(route) == [method], f"注册了路由 {route} [{method}]")
+
+        # ---- 上传：边界 ----
+        plugin_main.request = FakeWebRequest({}, files={})
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        check(resp.status_code == 400, "没带文件时返回 400")
+
+        plugin._apply_config({"allow_subplugin_upload": False})
+        plugin_main.request = FakeWebRequest(
+            {}, files={"file": FakeUpload("x.py", b"pass\n")}
+        )
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        check(
+            resp.status_code == 400 and "未启用" in body_of(resp).get("message", ""),
+            "上传开关关闭时拒绝",
+        )
+
+        plugin._apply_config(
+            {"allow_subplugin_upload": True, "max_subplugin_upload_kb": 2048}
+        )
+        plugin_main.request = FakeWebRequest(
+            {}, files={"file": FakeUpload("my-bad.py", b"pass\n")}
+        )
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        check(resp.status_code == 400, "非法名字（连字符）被拒")
+
+        # ---- 上传：正常单文件 ----
+        code = "\n".join(
+            [
+                "from astrbot.api.event import AstrMessageEvent",
+                "",
+                "",
+                "@lazy_tool(name='smoke_tmp_tool', tags=('smoke',))",
+                "async def smoke_tmp_tool(event: AstrMessageEvent, text: str) -> str:",
+                '    """临时工具。',
+                "",
+                "    Args:",
+                "        text(string): 内容",
+                '    """',
+                "    return text",
+                "",
+            ]
+        ).encode("utf-8")
+        plugin_main.request = FakeWebRequest(
+            {}, files={"file": FakeUpload("smoke_tmp.py", code)}
+        )
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        payload = body_of(resp)
+        check(
+            resp.status_code == 200 and payload.get("name") == "smoke_tmp",
+            f"单文件子插件上传成功：{payload}",
+        )
+        check(
+            "smoke_tmp_tool" in {t.name for t in llm_tools.func_list},
+            "上传的工具进了 AstrBot 全局 llm_tools",
+        )
+        check(REGISTRY.get("smoke_tmp_tool") is not None, "上传的工具进了本插件注册表")
+        check((scratch / "smoke_tmp.py").is_file(), "文件落在 sub_plugins/")
+
+        plugin_main.request = FakeWebRequest(
+            {}, files={"file": FakeUpload("smoke_tmp.py", code)}
+        )
+        resp = asyncio.run(plugin.page_upload_subplugin())
+        check(resp.status_code == 400, "同名重复上传被拒（需先删除）")
+
+        # ---- 删除（降级路径）：全局表清不掉时，也必须保证不再注入 ----
+        # FakeContext2 没有 get_llm_tool_manager，正好模拟「取不到全局工具表」
+        plugin_main.request = FakeWebRequest({"name": "smoke_tmp"})
+        resp = asyncio.run(plugin.page_delete_subplugin())
+        payload = body_of(resp)
+        check(
+            resp.status_code == 200 and payload.get("removed_tools", 0) >= 1,
+            f"删除返回：{payload}",
+        )
+        check(not (scratch / "smoke_tmp.py").exists(), "删除后文件消失")
+        check(
+            REGISTRY.get("smoke_tmp_tool") is not None
+            and REGISTRY.is_source_retired("smoke_tmp"),
+            "走兜底路径：工具定义保留并标记为已退休",
+        )
+        check(
+            REGISTRY.get("smoke_tmp_tool") not in REGISTRY.candidates(),
+            "退休后不再参与检索",
+        )
+
+        # 真正要守的不变量：无论走哪条路径，被删工具都不能出现在注入结果里
+        toolset5 = ToolSet()
+        for tool in llm_tools.func_list:
+            if tool.name in ("smoke_tmp_tool", "lazy_search_tools"):
+                toolset5.add_tool(tool)
+        turn5 = types.SimpleNamespace(
+            prompt="任意内容", func_tool=toolset5
+        )
+        event5 = types.SimpleNamespace(
+            unified_msg_origin="aiocqhttp:GroupMessage:deleted",
+            message_str="任意内容",
+        )
+        plugin._decide(event5, turn5)
+        check(
+            "smoke_tmp_tool" not in turn5.func_tool.names(),
+            "降级路径下被删工具仍被裁掉（不会因为查不到而被照常注入）",
+        )
+        check("lazy_search_tools" in turn5.func_tool.names(), "元工具不受影响")
+
+        # ---- 删除（正常路径）：能清全局表时就彻底遗忘 ----
+        code2 = "\n".join(
+            [
+                "from astrbot.api.event import AstrMessageEvent",
+                "",
+                "",
+                "@lazy_tool(name='smoke_tmp2_tool', tags=('smoke',))",
+                "async def smoke_tmp2_tool(event: AstrMessageEvent, text: str) -> str:",
+                '    """临时工具二。',
+                "",
+                "    Args:",
+                "        text(string): 内容",
+                '    """',
+                "    return text",
+                "",
+            ]
+        ).encode("utf-8")
+        plugin_main.request = FakeWebRequest(
+            {}, files={"file": FakeUpload("smoke_tmp2.py", code2)}
+        )
+        asyncio.run(plugin.page_upload_subplugin())
+        check(
+            "smoke_tmp2_tool" in {t.name for t in llm_tools.func_list},
+            "第二个子插件上传成功",
+        )
+
+        class FakeContextWithManager:
+            """带 get_llm_tool_manager 的替身，返回 AstrBot 真正的 llm_tools。"""
+
+            def register_web_api(self, route, handler, methods, description):
+                pass
+
+            def get_llm_tool_manager(self):
+                return llm_tools
+
+        plugin.context = FakeContextWithManager()
+        plugin_main.request = FakeWebRequest({"name": "smoke_tmp2"})
+        payload = body_of(asyncio.run(plugin.page_delete_subplugin()))
+        check(payload.get("removed_tools", 0) >= 1, f"正常路径删除返回：{payload}")
+        check(
+            "smoke_tmp2_tool" not in {t.name for t in llm_tools.func_list},
+            "正常路径：已从 AstrBot 全局工具表移除",
+        )
+        check(
+            REGISTRY.get("smoke_tmp2_tool") is None,
+            "正常路径：本插件注册表也已遗忘（界面上不再显示）",
+        )
+
+        # ---- 指令面板：默认关闭 ----
+        plugin._apply_config({})
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_commands()))
+        check(payload.get("supported") is False, "指令面板默认关闭")
+        check("未启用" in payload.get("reason", ""), "给出可读的关闭原因")
+        resp = asyncio.run(plugin.page_rename_command())
+        check(resp.status_code == 400, "面板关闭时改指令被拒")
+
+        # ---- 指令面板：用假实现钉住调用契约 ----
+        calls: list[tuple] = []
+
+        class FakeCommandManagement:
+            async def list_commands(self):
+                return [
+                    {
+                        "handler_full_name": "m.h",
+                        "effective_command": "demo",
+                        "aliases": [],
+                        "permission": "everyone",
+                        "enabled": True,
+                        "plugin": "p",
+                        "sub_commands": [],
+                    }
+                ]
+
+            async def list_command_conflicts(self):
+                return []
+
+            async def rename_command(self, handler_full_name, new_fragment, aliases=None):
+                calls.append(("rename", handler_full_name, new_fragment, aliases))
+                return types.SimpleNamespace(
+                    handler_full_name=handler_full_name,
+                    effective_command=new_fragment,
+                    aliases=aliases or [],
+                )
+
+            async def toggle_command(self, handler_full_name, enabled):
+                calls.append(("toggle", handler_full_name, enabled))
+                return types.SimpleNamespace(
+                    handler_full_name=handler_full_name, enabled=enabled
+                )
+
+            async def update_command_permission(self, handler_full_name, permission_type):
+                calls.append(("permission", handler_full_name, permission_type))
+                return types.SimpleNamespace(
+                    handler_full_name=handler_full_name, permission=permission_type
+                )
+
+        plugin_main.command_management = FakeCommandManagement()
+        plugin._apply_config({"enable_command_panel": True})
+
+        payload = body_of(asyncio.run(plugin.page_commands()))
+        check(
+            payload.get("supported") is True and len(payload.get("commands", [])) == 1,
+            "开启后能列出指令",
+        )
+
+        plugin_main.request = FakeWebRequest(
+            {"handler_full_name": "m.h", "fragment": "newname", "aliases": ["a", "b"]}
+        )
+        body_of(asyncio.run(plugin.page_rename_command()))
+        check(
+            calls[-1] == ("rename", "m.h", "newname", ["a", "b"]),
+            f"rename 参数正确：{calls[-1]}",
+        )
+
+        plugin_main.request = FakeWebRequest(
+            {"handler_full_name": "m.h", "enabled": False}
+        )
+        body_of(asyncio.run(plugin.page_toggle_command()))
+        check(calls[-1] == ("toggle", "m.h", False), f"toggle 参数正确：{calls[-1]}")
+
+        plugin_main.request = FakeWebRequest(
+            {"handler_full_name": "m.h", "permission": "admin"}
+        )
+        body_of(asyncio.run(plugin.page_set_command_permission()))
+        check(
+            calls[-1] == ("permission", "m.h", "admin"),
+            f"permission 按位置传参（形参名是 permission_type）：{calls[-1]}",
+        )
+
+        plugin_main.request = FakeWebRequest(
+            {"handler_full_name": "m.h", "permission": "everyone"}
+        )
+        resp = asyncio.run(plugin.page_set_command_permission())
+        check(resp.status_code == 400, "everyone 被拒（AstrBot 不接受该值）")
+
+        plugin_main.request = FakeWebRequest({"handler_full_name": "", "fragment": "x"})
+        resp = asyncio.run(plugin.page_rename_command())
+        check(resp.status_code == 400, "缺 handler_full_name 被拒")
+    finally:
+        plugin.loader.root = real_loader_root
+        plugin_main.command_management = real_cmd_mgmt
+        shutil.rmtree(scratch, ignore_errors=True)
 
     total = _PASSED + len(_FAILED)
     print()

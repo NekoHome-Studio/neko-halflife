@@ -483,3 +483,74 @@ input:focus {
   z-index: 20;
   max-width: 90vw;
 }
+
+/* ---- 子插件删除按钮与上传 ---- */
+
+.source-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.btn-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+#upload-input {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 100%;
+}
+
+.upload-result {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+/* ---- 指令面板 ---- */
+
+.conflict-box {
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.conflict-title {
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.cmd-input,
+.cmd-select {
+  width: 100%;
+  min-width: 96px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.cmd-input:disabled,
+.cmd-select:disabled {
+  opacity: 0.55;
+}
+
+#commands-body .table td {
+  vertical-align: middle;
+}

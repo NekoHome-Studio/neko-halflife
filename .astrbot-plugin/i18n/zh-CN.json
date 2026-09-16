@@ -38,7 +38,11 @@
       "running": "启用中",
       "loading": "同步中…",
       "synced": "已同步",
-      "failed": "读取失败"
+      "failed": "读取失败",
+      "upload": "上传子插件",
+      "upload_hint": "支持单个 .py 或含 __init__.py 的 .zip 包；同名已存在时请先删除",
+      "install": "安装",
+      "commands": "指令面板"
     }
   }
 }

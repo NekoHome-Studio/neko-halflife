@@ -38,7 +38,11 @@
       "running": "Enabled",
       "loading": "Syncing…",
       "synced": "In sync",
-      "failed": "Load failed"
+      "failed": "Load failed",
+      "upload": "Upload sub-plugin",
+      "upload_hint": "A single .py file, or a .zip containing __init__.py; delete the existing one first if the name is taken",
+      "install": "Install",
+      "commands": "Command panel"
     }
   }
 }

@@ -65,6 +65,24 @@
     "default": [],
     "hint": "填写 sub_plugins/ 下要停用的子插件名；留空表示全部启用。用停用名单而不是启用名单，是因为后者无法区分「一个都不启用」和「留空=全部启用」。也可在 WebUI 的 Pages 面板或 /lazy_sub on|off 里切换，会自动写回这里"
   },
+  "allow_subplugin_upload": {
+    "description": "允许通过 WebUI 上传子插件",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，Pages 面板里可以上传 .py 或 .zip 子插件包，安装到 sub_plugins/ 并在 AstrBot 进程内加载。这会执行上传包里的 Python 代码——能访问这个面板的人已经是 dashboard 管理员（本就能装插件），所以能力等价；但仍建议只上传自己信任的包。关闭后上传接口直接拒绝"
+  },
+  "max_subplugin_upload_kb": {
+    "description": "子插件上传体积上限（KB）",
+    "type": "int",
+    "default": 2048,
+    "hint": "同时限制压缩包大小与解压后总大小（会防压缩炸弹）。0 表示不限制"
+  },
+  "enable_command_panel": {
+    "description": "启用指令面板",
+    "type": "bool",
+    "default": false,
+    "hint": "在 Pages 面板里列出所有指令并支持改指令名/别名、启停、权限。这是 AstrBot 的通用管理功能（复用官方 command_management，与 dashboard 自带的指令管理数据同源），与本插件「懒加载工具」主题无关，为保持插件定位清晰默认关闭。需要 AstrBot 提供 astrbot.core.star.command_management，缺失时面板会显示不支持而不影响其它功能"
+  },
   "debug": {
     "description": "输出每轮注入明细日志",
     "type": "bool",
