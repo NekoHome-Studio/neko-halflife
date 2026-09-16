@@ -605,6 +605,21 @@ python tests/smoke_astrbot.py
 这些都用 scratch 目录（不污染仓库）。它把 AstrBot 的 `data/` 重定向到插件目录内的
 临时目录（已 gitignore），跑完自动删除。
 
+### 打包
+
+```bash
+git archive --format=zip -o dist/astrbot_plugin_neko_halflife-<ver>.zip HEAD
+```
+
+文件清单不手写——`.gitattributes` 里用 `export-ignore` 排掉了 `.gitignore` /
+`.gitattributes` / `dist/`，其余全部按 git 追踪的内容原样进包，
+`metadata.yaml` 落在压缩包根目录（`PluginUpdator.find_plugin_metadata_entry` 的要求）。
+手写清单迟早会漏（`core/learning.py` 这样的新增文件最容易忘），所以别手写。
+
+打包后建议再验一次：用 AstrBot 自己的 `PluginUpdator.validate_plugin_archive()`
+过一遍，然后把包解到临时目录、在里面**再跑一次两层测试**——
+这一步能抓到「源码里跑得通、但没被打进包」的缺文件问题。
+
 ---
 
 ## 版本敏感

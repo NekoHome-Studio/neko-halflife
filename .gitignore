@@ -14,6 +14,13 @@ venv/
 # ---- 版本兼容性验证用的 AstrBot 源码副本（见 README「版本敏感」）----
 .verify/
 
+# ---- AstrBot 自己的运行根目录 ----
+# 只要在仓库根目录跑过任何会 import astrbot 的脚本（例如用 PluginUpdator
+# 校验打包产物），AstrBot 就会在 cwd 下生成 data/（cmd_config.json 与
+# t2i_templates/）。它是运行期垃圾，不是插件的一部分——曾经因为 `git add -A`
+# 被打进过包里，所以这里显式排除。
+data/
+
 # ---- 工作区遗留，不属于插件本体 ----
 dsh-plugin-dev-main/
 dsh-plugin-dev-main.zip
