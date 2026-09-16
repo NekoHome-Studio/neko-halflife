@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -438,6 +439,19 @@ def main() -> int:
     html = (page_dir / "index.html").read_text(encoding="utf-8")
     check('type="module"' in html, "脚本以 module 方式加载（保证 bridge 先就位）")
     check("./app.js" in html and "./style.css" in html, "资源使用相对路径引用")
+
+    # 前端脚本的语法错误会让整个面板静默失效：iframe 里没有可见的报错，
+    # 页面只是"点不动"。所以这里真的解析一遍。
+    # 输出走继承的 stdio（不走管道）——沙箱环境下管道会踩到命名管道限制。
+    node = shutil.which("node")
+    if node:
+        checked = subprocess.run(
+            [node, "--check", str(page_dir / "app.js")],
+            check=False,
+        )
+        check(checked.returncode == 0, "app.js 通过 node --check 语法检查")
+    else:
+        print("     跳过：未找到 node，无法对 app.js 做语法检查")
 
     for locale in ("zh-CN", "en-US"):
         i18n_path = PLUGIN_ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
@@ -1126,19 +1140,50 @@ def main() -> int:
         registered5: list[tuple[str, list[str]]] = []
 
         class FakeProvider:
-            def __init__(self):
+            def __init__(self, model: str = "big-model", provider_id: str = "primary"):
                 self.calls = 0
+                self.seen_models: list[str | None] = []
+                self.provider_config = {
+                    "id": provider_id,
+                    "type": "openai_chat_completion",
+                }
+                self._model = model
+
+            def get_model(self) -> str:
+                return self._model
+
+            def meta(self):
+                return types.SimpleNamespace(
+                    id=self.provider_config["id"],
+                    model=self._model,
+                    type=self.provider_config["type"],
+                )
 
             async def text_chat(self, prompt=None, system_prompt=None, **kwargs):
                 self.calls += 1
+                self.seen_models.append(kwargs.get("model"))
+                # 只为本节用到的工具名作答。真实模型会给每个工具都回答，但那样
+                # 别的工具也会被贴上同样的标签，"补标签 → 能召回"就退化成一次
+                # 不确定的名次比较，断言也就不再说明问题。
+                known = {"meta_test_tool", "neko_ping_tool"}
+                names = [
+                    name
+                    for name in re.findall(r'"name":\s*"([^"]+)"', prompt or "")
+                    if name in known
+                ]
+                payload = {
+                    name: {
+                        "summary": "把用户的话原样回显",
+                        "tags": ["回显", "复述", "echo"],
+                    }
+                    for name in names
+                }
                 return types.SimpleNamespace(
-                    completion_text=(
-                        '{"meta_test_tool": {"summary": "把用户的话原样回显",'
-                        ' "tags": ["回显", "复述", "echo"]}}'
-                    )
+                    completion_text=json.dumps(payload, ensure_ascii=False)
                 )
 
         provider = FakeProvider()
+        cheap_provider = FakeProvider(model="tiny-model", provider_id="cheap")
 
         class FakeContext5:
             def register_web_api(self, route, handler, methods, description):
@@ -1150,12 +1195,28 @@ def main() -> int:
             def get_using_provider(self):
                 return provider
 
+            def get_all_providers(self):
+                return [provider, cheap_provider]
+
+            def get_provider_by_id(self, provider_id):
+                return {
+                    "primary": provider,
+                    "cheap": cheap_provider,
+                }.get(provider_id)
+
         plugin.context = FakeContext5()
         plugin._register_web_apis()
         routes5 = dict(registered5)
         for suffix in ("tools/update", "tools/reset", "tools/enrich"):
             route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
             check(routes5.get(route) == ["POST"], f"注册了路由 {route} [POST]")
+        for suffix, method in (
+            ("providers", "GET"),
+            ("providers/test", "POST"),
+            ("providers/save", "POST"),
+        ):
+            route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+            check(routes5.get(route) == [method], f"注册了路由 {route} [{method}]")
 
         # 造一个"原描述含糊、没有任何标签"的工具（正是导入进来的工具的样子）
         REGISTRY.register(
@@ -1223,6 +1284,96 @@ def main() -> int:
             bool(hits) and hits[0][0].name == "meta_test_tool",
             "LLM 补的标签同样能召回到",
         )
+
+        # ---- 自定义总结模型：选提供商 + 按次覆盖模型名 ----
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_providers()))
+        listed = [item["id"] for item in payload.get("items", [])]
+        check(listed == ["cheap", "primary"], f"providers 列出全部对话模型：{listed}")
+        check(
+            payload["effective"]["model"] == "big-model",
+            f"未配置时用会话默认模型：{payload['effective']}",
+        )
+        check(payload["configured"]["provider_id"] == "", "配置里默认不指定总结模型")
+
+        OVERRIDES.remove("meta_test_tool")
+        OVERRIDES.apply_all(REGISTRY)
+        plugin._rebuild_index()
+        before_primary, before_cheap = provider.calls, cheap_provider.calls
+        plugin_main.request = FakeWebRequest(
+            {"only_missing": False, "provider_id": "cheap", "model": "tiny-2"}
+        )
+        payload = body_of(asyncio.run(plugin.page_enrich_tools()))
+        check(cheap_provider.calls == before_cheap + 1, "请求里指定的提供商真的被调用")
+        check(provider.calls == before_primary, "会话默认提供商没有被牵连")
+        check(
+            cheap_provider.seen_models[-1] == "tiny-2",
+            f"模型名按次传入，不改全局配置：{cheap_provider.seen_models[-1]}",
+        )
+        check(
+            payload["provider"]["id"] == "cheap"
+            and payload["provider"]["model"] == "tiny-2",
+            f"返回值说明实际用了谁：{payload.get('provider')}",
+        )
+
+        # 配置里的 ID 失效 → 明确报错，绝不静默换一个模型顶替
+        plugin._llm_enrich_provider_id = "ghost"
+        plugin_main.request = FakeWebRequest({"only_missing": False})
+        payload = body_of(asyncio.run(plugin.page_enrich_tools()))
+        check(payload.get("updated") == {}, "配置的 ID 失效时不写入任何东西")
+        check(
+            any("ghost" in str(item) for item in payload.get("errors") or []),
+            f"报错里带上失效的 ID：{payload.get('errors')}",
+        )
+        plugin._llm_enrich_provider_id = ""
+
+        # ---- 试跑：走真实总结路径（同一个 system prompt、同一个 JSON 解析）----
+        plugin_main.request = FakeWebRequest({"provider_id": "cheap"})
+        payload = body_of(asyncio.run(plugin.page_test_provider()))
+        check(payload.get("ok") is True, f"试跑成功：{payload.get('sample')}")
+        check(isinstance(payload.get("latency_ms"), int), "给出耗时")
+        check(
+            OVERRIDES.get("neko_ping_tool") is None,
+            "试跑用的是合成工具名，不会往覆盖层写东西",
+        )
+
+        plugin_main.request = FakeWebRequest({"provider_id": "ghost"})
+        resp = asyncio.run(plugin.page_test_provider())
+        check(resp.status_code == 400, "试跑一个不存在的提供商返回 400")
+
+        # ---- 设为默认：写进插件配置并落盘 ----
+        class FakeConfig(dict):
+            def __init__(self):
+                super().__init__()
+                self.saved = 0
+
+            def save_config(self, *args, **kwargs):
+                self.saved += 1
+
+        real_config = plugin.config
+        cfg = FakeConfig()
+        plugin.config = cfg
+        try:
+            plugin_main.request = FakeWebRequest(
+                {"provider_id": "cheap", "model": "tiny-3"}
+            )
+            payload = body_of(asyncio.run(plugin.page_save_provider()))
+            check(payload.get("persisted") is True, "providers/save 把配置落盘了")
+            check(cfg.get("llm_enrich_provider_id") == "cheap", f"写进了配置：{dict(cfg)}")
+            check(plugin._llm_enrich_provider_id == "cheap", "内存里的设置同步了")
+            check(
+                plugin._summarizer_label().startswith("tiny-3"),
+                f"总览的说明随之更新：{plugin._summarizer_label()}",
+            )
+
+            plugin_main.request = FakeWebRequest({"provider_id": "ghost"})
+            resp = asyncio.run(plugin.page_save_provider())
+            check(resp.status_code == 400, "存一个不存在的提供商被拒")
+            check(cfg.get("llm_enrich_provider_id") == "cheap", "被拒后配置没被改坏")
+        finally:
+            plugin.config = real_config
+            plugin._llm_enrich_provider_id = ""
+            plugin._llm_enrich_model = ""
 
         # ---- 模型不可用时只报错、不崩 ----
         class NoProviderContext:

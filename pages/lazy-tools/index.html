@@ -61,6 +61,28 @@
             用 LLM 补全标签
           </button>
         </div>
+        <div class="panel-toolbar summarizer-bar">
+          <label class="muted" id="summarizer-label" for="summarizer-select">
+            总结模型
+          </label>
+          <select
+            id="summarizer-select"
+            class="cmd-select select-wide"
+          ></select>
+          <input
+            id="summarizer-model"
+            type="text"
+            class="cmd-input"
+            placeholder="模型名（可留空）"
+          />
+          <button id="summarizer-test" type="button" class="btn btn-small">
+            测试
+          </button>
+          <button id="summarizer-save" type="button" class="btn btn-small">
+            设为默认
+          </button>
+          <span class="muted" id="summarizer-hint"></span>
+        </div>
         <div class="table-wrap">
           <table class="table">
             <thead>

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -77,6 +78,8 @@ class EnrichResult:
     updated: dict[str, dict] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    #: 非致命说明（例如"模型覆盖被忽略"）。与 errors 分开：这些不算失败。
+    notes: list[str] = field(default_factory=list)
     raw: str = ""
 
     @property
@@ -214,15 +217,72 @@ def _brief_summary(brief: ToolBrief) -> str:
     return text[:60]
 
 
+def describe_provider(provider: Any) -> dict[str, str]:
+    """把 provider 摘成 ``{id, model, type}``，用于面板展示与报错。
+
+    一律走 ``getattr`` 兜底：第三方 provider 不一定实现了 ``meta()``，
+    而这个信息只用于展示，**不该因为拿不到就让总结整个失败**。
+    """
+    info = {"id": "", "model": "", "type": ""}
+    try:
+        meta = provider.meta()
+        info["id"] = str(getattr(meta, "id", "") or "")
+        info["model"] = str(getattr(meta, "model", "") or "")
+        info["type"] = str(getattr(meta, "type", "") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    if not info["model"]:
+        getter = getattr(provider, "get_model", None)
+        if callable(getter):
+            try:
+                info["model"] = str(getter() or "")
+            except Exception:  # noqa: BLE001
+                pass
+    if not info["type"]:
+        config = getattr(provider, "provider_config", None)
+        if isinstance(config, dict):
+            info["type"] = str(config.get("type") or "")
+            if not info["id"]:
+                info["id"] = str(config.get("id") or "")
+    if not info["id"]:
+        info["id"] = "default"
+    return info
+
+
+def provider_supports_model(provider: Any) -> bool:
+    """该 provider 的 ``text_chat`` 能不能接受 ``model`` 参数。
+
+    基类 ``Provider.text_chat`` 的签名里有 ``model``（OpenAI 兼容实现会用它
+    ``model = model or self.get_model()``），但不是每个第三方 provider 都跟上了。
+    先探测再传，避免为了一个"锦上添花"的模型覆盖把整次总结搞崩。
+    """
+    handler = getattr(provider, "text_chat", None)
+    if not callable(handler):
+        return False
+    try:
+        parameters = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+    if "model" in parameters:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+
+
 async def enrich(
     provider: Any,
     briefs: list[ToolBrief],
     *,
     timeout: float = DEFAULT_TIMEOUT,
+    model: str | None = None,
 ) -> EnrichResult:
     """调用模型为一批工具生成 summary/tags。
 
     provider 为 ``None`` 或调用失败时返回带 errors 的结果，**不抛异常**。
+
+    ``model`` 是**按次**覆盖（``text_chat(model=...)``），不会去改 provider
+    在全局配置里的模型——否则一次后台总结就会把主人正在聊天的模型换掉。
     """
     result = EnrichResult()
     if not briefs:
@@ -231,13 +291,27 @@ async def enrich(
         result.errors.append("没有可用的对话模型（请先在 AstrBot 里配置一个 LLM 提供商）。")
         return result
 
+    kwargs: dict[str, Any] = {
+        "prompt": build_user_prompt(briefs),
+        "system_prompt": SYSTEM_PROMPT,
+    }
+    if model:
+        if provider_supports_model(provider):
+            kwargs["model"] = model
+            result.notes.append(f"已按配置覆盖模型：{model}")
+        else:
+            # 说清楚"你配了但没生效"，而不是静默忽略
+            result.notes.append(
+                f"该提供商不支持按次指定模型，已忽略 llm_enrich_model={model}。"
+            )
+            logger.warning(
+                "[neko-halflife] provider 不支持 model 参数，忽略模型覆盖：%s", model
+            )
+
     allowed = {brief.name for brief in briefs}
     try:
         response = await asyncio.wait_for(
-            provider.text_chat(
-                prompt=build_user_prompt(briefs),
-                system_prompt=SYSTEM_PROMPT,
-            ),
+            provider.text_chat(**kwargs),
             timeout=timeout,
         )
     except asyncio.TimeoutError:

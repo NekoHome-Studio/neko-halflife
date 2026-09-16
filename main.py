@@ -555,6 +555,9 @@ class LazyToolsPlugin(Star):
             ("tools/update", self.page_update_tool, ["POST"], "手动修改工具的标签与描述"),
             ("tools/reset", self.page_reset_tool, ["POST"], "撤销工具的手动覆盖"),
             ("tools/enrich", self.page_enrich_tools, ["POST"], "用 LLM 总结工具描述与标签"),
+            ("providers", self.page_providers, ["GET"], "列出可用于总结的对话模型"),
+            ("providers/test", self.page_test_provider, ["POST"], "试跑一次总结调用"),
+            ("providers/save", self.page_save_provider, ["POST"], "把总结模型写进插件配置"),
             ("learning/list", self.page_learning_list, ["GET"], "查看学习样例与归纳出的候选标签"),
             ("learning/clear", self.page_learning_clear, ["POST"], "清除学习样例"),
             ("learning/forget", self.page_learning_forget, ["POST"], "删除一条学错的样例"),
@@ -636,6 +639,10 @@ class LazyToolsPlugin(Star):
                     "max_result_chars": RESULT_LIMITS.get("default"),
                     "allow_high_risk_auto": self._allow_high_risk,
                     "meta_tools_enabled": self._meta_enabled,
+                    "learning_enabled": self._learning_enabled,
+                    "llm_enrich": bool(self._llm_enrich and self._llm_enrich_max),
+                    # 面板上直接显示"总结到底会用哪个模型"，比让用户去猜配置更省事
+                    "summarizer": self._summarizer_label(),
                     "debug": self._debug,
                 },
                 "tools": tools,
@@ -1417,16 +1424,70 @@ class LazyToolsPlugin(Star):
 
     # ---- 工具元数据：手动覆盖 + LLM 总结 --------------------------------
 
-    def _provider(self) -> Any | None:
-        """取当前默认的对话模型；拿不到就返回 None（调用方据此降级）。"""
+    def _resolve_enrich_provider(
+        self, provider_id: str | None = None, model: str | None = None
+    ) -> tuple[Any | None, dict[str, str], str, str]:
+        """决定这次总结用哪个模型。
+
+        优先用配置里指定的提供商 ID；留空才退回「当前会话默认模型」。
+        做成可选的原因很实际：**总结是后台辅助调用**，不该跟主人日常聊天抢
+        同一个模型——导入 20 个工具可能一秒内打好几次请求，用一个便宜的小模型
+        更合适，也免得把正在用的模型的额度/上下文搅在一起。
+
+        Returns:
+            ``(provider, info, model, error)``；provider 为 None 时 error 是可读原因。
+        """
+        want_id = (
+            self._llm_enrich_provider_id if provider_id is None else str(provider_id)
+        ).strip()
+        want_model = (self._llm_enrich_model if model is None else str(model)).strip()
+
+        if want_id:
+            try:
+                provider = self.context.get_provider_by_id(want_id)
+            except Exception as exc:  # noqa: BLE001
+                return None, {}, want_model, f"按 ID 取对话模型失败：{exc}"
+            if provider is None:
+                return (
+                    None,
+                    {},
+                    want_model,
+                    f"配置里指定的总结模型 ID「{want_id}」不存在"
+                    "（可能已被删除或改过 ID）；留空则使用当前会话默认模型。",
+                )
+            return provider, enrich.describe_provider(provider), want_model, ""
+
         try:
-            return self.context.get_using_provider()
+            provider = self.context.get_using_provider()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[neko-halflife] 获取对话模型失败：%s", exc)
-            return None
+            return None, {}, want_model, f"获取对话模型失败：{exc}"
+        if provider is None:
+            return (
+                None,
+                {},
+                want_model,
+                "没有可用的对话模型（请先在 AstrBot 里配置一个 LLM 提供商）。",
+            )
+        return provider, enrich.describe_provider(provider), want_model, ""
+
+    def _summarizer_label(self) -> str:
+        """一句话说明总结会用哪个模型，供总览面板显示。"""
+        provider, info, model, error = self._resolve_enrich_provider()
+        if provider is None:
+            return error or "无可用模型"
+        # 注意用解析后的 model：它可能是 llm_enrich_model 的按次覆盖，
+        # 直接用 provider 自己的模型名会把"覆盖"这件事显示没。
+        name = model or info.get("model") or "未知模型"
+        source = "配置指定" if self._llm_enrich_provider_id else "会话默认"
+        return f"{name}（{source} · {info.get('id') or '?'}）"
 
     async def _enrich_tools(
-        self, names: list[str] | None = None, *, only_missing: bool = True
+        self,
+        names: list[str] | None = None,
+        *,
+        only_missing: bool = True,
+        provider_id: str | None = None,
+        model: str | None = None,
     ) -> dict:
         """用 LLM 给工具生成 summary/tags，写入覆盖层。失败不抛异常。"""
         briefs = enrich.collect_briefs(REGISTRY, names, only_missing=only_missing)
@@ -1437,13 +1498,32 @@ class LazyToolsPlugin(Star):
             return {
                 "updated": {},
                 "errors": [],
+                "notes": [],
                 "skipped": [],
                 "considered": considered,
                 "sent": 0,
+                "provider": None,
+            }
+
+        provider, info, use_model, error = self._resolve_enrich_provider(
+            provider_id, model
+        )
+        if provider is None:
+            return {
+                "updated": {},
+                "errors": [error],
+                "notes": [],
+                "skipped": [],
+                "considered": considered,
+                "sent": 0,
+                "provider": None,
             }
 
         result = await enrich.enrich(
-            self._provider(), briefs, timeout=self._llm_enrich_timeout
+            provider,
+            briefs,
+            timeout=self._llm_enrich_timeout,
+            model=use_model or None,
         )
         for name, payload in result.updated.items():
             # source="llm"：不会盖掉用户手改过的同名覆盖
@@ -1460,9 +1540,11 @@ class LazyToolsPlugin(Star):
         return {
             "updated": result.updated,
             "errors": result.errors,
+            "notes": result.notes,
             "skipped": result.skipped,
             "considered": considered,
             "sent": len(briefs),
+            "provider": {**info, "model": use_model or info.get("model", "")},
         }
 
     async def page_update_tool(self):
@@ -1530,6 +1612,9 @@ class LazyToolsPlugin(Star):
 
         默认 ``only_missing=True``：只补"还没有标签"的工具，避免把用户手写好的
         标签再总结一遍（既费 token 又可能覆盖掉好的）。
+
+        请求体可带 ``provider_id`` / ``model`` 覆盖配置里的总结模型
+        （面板上的下拉框就是这么用的），留空则按配置解析。
         """
         payload = await request.json(default={})
         if not isinstance(payload, dict):
@@ -1541,8 +1626,151 @@ class LazyToolsPlugin(Star):
             else None
         )
         only_missing = bool(payload.get("only_missing", True))
-        result = await self._enrich_tools(names, only_missing=only_missing)
+        provider_id = payload.get("provider_id")
+        model = payload.get("model")
+        result = await self._enrich_tools(
+            names,
+            only_missing=only_missing,
+            provider_id=None if provider_id is None else str(provider_id),
+            model=None if model is None else str(model),
+        )
         return json_response(result)
+
+    # ---- 总结模型：列出可选提供商、试跑、记住选择 ------------------------
+
+    def _list_providers(self) -> list[dict]:
+        """列出可选的对话模型提供商（供面板下拉框使用）。"""
+        try:
+            providers = list(self.context.get_all_providers() or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[neko-halflife] 列出对话模型失败：%s", exc)
+            return []
+        items = []
+        for provider in providers:
+            info = enrich.describe_provider(provider)
+            info["supports_model"] = enrich.provider_supports_model(provider)
+            items.append(info)
+        items.sort(key=lambda item: (item.get("id", ""), item.get("model", "")))
+        return items
+
+    async def page_providers(self):
+        """列出可选的总结模型，并说明当前配置实际解析成了谁。"""
+        provider, info, model, error = self._resolve_enrich_provider()
+        return json_response(
+            {
+                "items": self._list_providers(),
+                "configured": {
+                    "provider_id": self._llm_enrich_provider_id,
+                    "model": self._llm_enrich_model,
+                },
+                "effective": {
+                    **info,
+                    "model": model or info.get("model", ""),
+                    "resolved": provider is not None,
+                    "error": error,
+                },
+                "enabled": bool(self._llm_enrich and self._llm_enrich_max),
+            }
+        )
+
+    async def page_test_provider(self):
+        """试跑一次总结调用，让用户先确认模型能用再谈批量总结。
+
+        用的是**真实的总结路径**（同一个 system prompt、同一个 JSON 解析），
+        只是拿一个合成工具去问——所以它通过，说明这条路真的通，
+        而不是"能 ping 到"。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        provider_id = payload.get("provider_id")
+        model = payload.get("model")
+        provider, info, use_model, error = self._resolve_enrich_provider(
+            None if provider_id is None else str(provider_id),
+            None if model is None else str(model),
+        )
+        if provider is None:
+            return error_response(error or "没有可用的对话模型。")
+
+        brief = enrich.ToolBrief(
+            name="neko_ping_tool",
+            description="An internal connectivity check tool for the summarizer.",
+        )
+        started = time.monotonic()
+        result = await enrich.enrich(
+            provider,
+            [brief],
+            timeout=self._llm_enrich_timeout,
+            model=use_model or None,
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        sample = (result.updated or {}).get("neko_ping_tool") or {}
+        return json_response(
+            {
+                "ok": bool(result.updated),
+                "latency_ms": latency_ms,
+                "provider": {**info, "model": use_model or info.get("model", "")},
+                "sample": sample,
+                "errors": result.errors,
+                "notes": result.notes,
+                "raw_preview": (result.raw or "")[:300],
+            }
+        )
+
+    async def page_save_provider(self):
+        """把面板上选的总结模型写进插件配置（持久化）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        if "provider_id" not in payload and "model" not in payload:
+            return error_response("请至少提供 provider_id 或 model。")
+        updates: dict[str, str] = {}
+        if "provider_id" in payload:
+            updates["llm_enrich_provider_id"] = str(payload.get("provider_id") or "").strip()
+        if "model" in payload:
+            updates["llm_enrich_model"] = str(payload.get("model") or "").strip()
+
+        # 先确认这个组合真的能解析出来，避免把一个坏 ID 存进配置——
+        # 存进去之后每次导入都会失败，而失败信息只在日志里，很难查。
+        provider, info, use_model, error = self._resolve_enrich_provider(
+            updates.get("llm_enrich_provider_id", self._llm_enrich_provider_id),
+            updates.get("llm_enrich_model", self._llm_enrich_model),
+        )
+        if provider is None:
+            return error_response(error or "该总结模型无法解析。")
+
+        persisted = False
+        try:
+            config = self.config
+            save = getattr(config, "save_config", None)
+            for key, value in updates.items():
+                if hasattr(config, "__setitem__"):
+                    config[key] = value
+            if callable(save):
+                save()
+                persisted = True
+            else:
+                logger.warning(
+                    "[neko-halflife] 配置对象没有 save_config，改动只在本次运行内生效"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[neko-halflife] 保存总结模型配置失败：%s", exc)
+            return error_response(f"保存配置失败：{exc}")
+
+        if "llm_enrich_provider_id" in updates:
+            self._llm_enrich_provider_id = updates["llm_enrich_provider_id"]
+        if "llm_enrich_model" in updates:
+            self._llm_enrich_model = updates["llm_enrich_model"]
+        return json_response(
+            {
+                "persisted": persisted,
+                "configured": {
+                    "provider_id": self._llm_enrich_provider_id,
+                    "model": self._llm_enrich_model,
+                },
+                "effective": {**info, "model": use_model or info.get("model", "")},
+            }
+        )
 
     # ---- 归纳学习：查看、清除、采纳候选标签 ------------------------------
 
@@ -1688,6 +1916,8 @@ class LazyToolsPlugin(Star):
         self._llm_enrich = bool(get("llm_enrich_on_import", True))
         self._llm_enrich_max = max(int(get("llm_enrich_max_tools", 20) or 0), 0)
         self._llm_enrich_timeout = max(float(get("llm_enrich_timeout", 60) or 0.0), 5.0)
+        self._llm_enrich_provider_id = str(get("llm_enrich_provider_id", "") or "").strip()
+        self._llm_enrich_model = str(get("llm_enrich_model", "") or "").strip()
         self._learning_enabled = bool(get("learning_enabled", True))
         self._learning_max = max(int(get("learning_max_examples", 20) or 1), 1)
         self._induct_min_hits = max(int(get("induction_min_hits", 3) or 1), 1)

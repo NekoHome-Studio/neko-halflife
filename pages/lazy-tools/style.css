@@ -626,6 +626,30 @@ input:focus {
   white-space: nowrap;
 }
 
+/* ---- 总结模型选择条 ---- */
+
+.summarizer-bar {
+  /* 左对齐成一条紧凑的工具条，而不是让 hint 被 justify-content 推到最右 */
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.select-wide {
+  min-width: 260px;
+  max-width: 100%;
+}
+
+.summarizer-bar .cmd-input {
+  min-width: 160px;
+}
+
+#summarizer-hint {
+  font-size: 12px;
+}
+
 #tools-body .table td {
   vertical-align: middle;
 }

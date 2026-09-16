@@ -74,6 +74,12 @@ const dom = {
   toolsSummary: document.getElementById("tools-summary"),
   toolsHint: document.getElementById("tools-hint"),
   enrichButton: document.getElementById("enrich-button"),
+  summarizerLabel: document.getElementById("summarizer-label"),
+  summarizerSelect: document.getElementById("summarizer-select"),
+  summarizerModel: document.getElementById("summarizer-model"),
+  summarizerTest: document.getElementById("summarizer-test"),
+  summarizerSave: document.getElementById("summarizer-save"),
+  summarizerHint: document.getElementById("summarizer-hint"),
   toolsBody: document.getElementById("tools-body"),
   thName: document.getElementById("th-name"),
   thSource: document.getElementById("th-source"),
@@ -190,6 +196,19 @@ function applyLabels() {
     "标签是懒加载的召回依据，可直接编辑后保存；改动只写入覆盖层，不动源码",
   );
   dom.enrichButton.textContent = t("pages.lazy-tools.enrich", "用 LLM 补全标签");
+  dom.summarizerLabel.textContent = t(
+    "pages.lazy-tools.summarizer",
+    "总结模型",
+  );
+  dom.summarizerTest.textContent = t("pages.lazy-tools.summarizer_test", "测试");
+  dom.summarizerSave.textContent = t(
+    "pages.lazy-tools.summarizer_save",
+    "设为默认",
+  );
+  dom.summarizerModel.placeholder = t(
+    "pages.lazy-tools.summarizer_model_placeholder",
+    "模型名（可留空）",
+  );
   dom.thName.textContent = t("pages.lazy-tools.col_name", "工具名");
   dom.thSource.textContent = t("pages.lazy-tools.col_source", "来源");
   dom.thTags.textContent = t("pages.lazy-tools.col_tags", "标签");
@@ -576,6 +595,7 @@ async function loadState(force = false) {
       inputsInitialized = true;
     }
     if (!force) setBadge(t("pages.lazy-tools.synced", "已同步"), "ok");
+    await loadSummarizers();
     await loadCommands();
     await loadImportCandidates();
     await loadLearning();
@@ -772,21 +792,150 @@ async function enrichTools() {
   clearError();
   dom.toolsHint.textContent = "正在调用模型总结…";
   try {
-    const result = await callPost("tools/enrich", { only_missing: true });
+    const result = await callPost("tools/enrich", {
+      only_missing: true,
+      // 面板上选的模型只作用于这一次调用；要固化成默认请点「设为默认」
+      ...summarizerChoice(),
+    });
     const count = Object.keys(result.updated || {}).length;
     const errors = result.errors || [];
+    const notes = result.notes || [];
     if (count) {
+      const who = result.provider?.model
+        ? ` · 模型 ${result.provider.model}`
+        : "";
       showToast(
         `已为 ${count} 个工具补充标签` +
-          `（缺标签候选 ${result.considered} 个，本次送 ${result.sent} 个）`,
+          `（缺标签候选 ${result.considered} 个，本次送 ${result.sent} 个${who}）`,
       );
     }
+    if (notes.length) showToast(notes.join("；"));
     if (errors.length) {
       showError(`LLM 总结未完成：${errors.join("；")}`);
     } else if (!count) {
       showToast("没有需要补标签的工具（都已有标签）");
     }
     await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 总结模型：列出、试跑、设为默认                                      */
+/* ------------------------------------------------------------------ */
+
+/* 空字符串表示「用当前会话默认模型」——这是默认值，也是唯一不需要记 ID 的选项。 */
+const SUMMARIZER_DEFAULT = "";
+
+/* 只在首次同步时把配置值回填进输入框，避免刷掉用户正在编辑的内容。 */
+let summarizerInitialized = false;
+
+function summarizerChoice() {
+  return {
+    provider_id: dom.summarizerSelect.value || "",
+    model: (dom.summarizerModel.value || "").trim(),
+  };
+}
+
+function summarizerOptionLabel(item) {
+  const model = item.model || "(未命名模型)";
+  const type = item.type ? ` · ${item.type}` : "";
+  const id = item.id || "default";
+  return `${model}${type}  [${id}]`;
+}
+
+async function loadSummarizers() {
+  let payload;
+  try {
+    payload = await callGet("providers");
+  } catch (error) {
+    dom.summarizerHint.textContent = `读取对话模型失败：${
+      error?.message || error
+    }`;
+    return;
+  }
+
+  const items = payload.items || [];
+  clear(dom.summarizerSelect);
+  const auto = el(
+    "option",
+    null,
+    t("pages.lazy-tools.summarizer_auto", "当前会话默认模型"),
+  );
+  auto.value = SUMMARIZER_DEFAULT;
+  dom.summarizerSelect.append(auto);
+  for (const item of items) {
+    const option = el("option", null, summarizerOptionLabel(item));
+    option.value = item.id || "";
+    dom.summarizerSelect.append(option);
+  }
+
+  const wanted = payload.configured?.provider_id || SUMMARIZER_DEFAULT;
+  dom.summarizerSelect.value = wanted;
+  // 配置里的 ID 在当前提供商列表里找不到时，select 会静默回落到第一项，
+  // 那会让用户以为"配置生效了"。这里显式说出来。
+  if (wanted && dom.summarizerSelect.value !== wanted) {
+    const ghost = el("option", null, `（已失效）${wanted}`);
+    ghost.value = wanted;
+    dom.summarizerSelect.append(ghost);
+    dom.summarizerSelect.value = wanted;
+  }
+  // 只在首次同步时回填输入框：否则用户刚敲进去还没保存的模型名会被刷掉
+  if (!summarizerInitialized) {
+    dom.summarizerModel.value = payload.configured?.model || "";
+    summarizerInitialized = true;
+  }
+
+  const effective = payload.effective || {};
+  if (effective.resolved) {
+    dom.summarizerHint.textContent =
+      `当前生效：${effective.model || "未知模型"}` +
+      `（${summarySourceLabel(wanted)}）`;
+  } else {
+    dom.summarizerHint.textContent = effective.error || "没有可用的对话模型";
+  }
+}
+
+function summarySourceLabel(providerId) {
+  return providerId
+    ? t("pages.lazy-tools.summarizer_configured", "配置指定")
+    : t("pages.lazy-tools.summarizer_session", "会话默认");
+}
+
+async function testSummarizer() {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  dom.summarizerHint.textContent = "正在试跑总结调用…";
+  try {
+    const result = await callPost("providers/test", summarizerChoice());
+    const tags = (result.sample?.tags || []).join("、");
+    dom.summarizerHint.textContent =
+      `可用 · ${result.latency_ms}ms · ${result.provider?.model || "?"}` +
+      (tags ? ` · 示例标签：${tags}` : "");
+    showToast(`总结模型可用（${result.latency_ms}ms）`);
+  } catch (error) {
+    dom.summarizerHint.textContent = `试跑失败：${error?.message || error}`;
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function saveSummarizer() {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("providers/save", summarizerChoice());
+    const persisted = result.persisted
+      ? "已写入插件配置"
+      : "已生效，但配置未落盘（本次运行内有效）";
+    showToast(`${persisted}：${result.effective?.model || "当前会话默认模型"}`);
+    await loadSummarizers();
   } catch (error) {
     showError(error?.message || String(error));
   } finally {
@@ -1311,6 +1460,8 @@ function bindEvents() {
   dom.searchButton.addEventListener("click", runSearch);
   dom.uploadButton.addEventListener("click", uploadSubplugin);
   dom.enrichButton.addEventListener("click", enrichTools);
+  dom.summarizerTest.addEventListener("click", testSummarizer);
+  dom.summarizerSave.addEventListener("click", saveSummarizer);
   dom.learningClearAll.addEventListener("click", () => clearLearning(""));
   dom.rescanButton.addEventListener("click", rescanSubplugins);
   dom.queryInput.addEventListener("keydown", (event) => {

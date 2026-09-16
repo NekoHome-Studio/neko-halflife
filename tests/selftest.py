@@ -743,6 +743,92 @@ def test_enrich_parsing() -> None:
     check(len(all_briefs) == 2, "only_missing=False 时全都送")
 
 
+def test_enrich_model_override() -> None:
+    print("enrich / 自定义总结模型（provider 选择 + 按次模型覆盖）")
+    import asyncio as _asyncio
+
+    from core.enrich import (
+        ToolBrief,
+        describe_provider,
+        enrich,
+        provider_supports_model,
+    )
+
+    class FakeProvider:
+        def __init__(self, *, accept_model: bool = True) -> None:
+            self.calls: list[dict] = []
+            self.provider_config = {"id": "cheap-llm", "type": "openai_chat_completion"}
+            self.accept_model = accept_model
+
+        def meta(self):
+            raise RuntimeError("第三方 provider 可能没有 meta()")
+
+        def get_model(self) -> str:
+            return "default-model"
+
+        async def text_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return type("R", (), {"completion_text": '{"t1": {"tags": ["天气"]}}'})()
+
+    class LegitProvider(FakeProvider):
+        def meta(self):
+            return type(
+                "M", (), {"id": "cheap-llm", "model": "default-model", "type": "openai"}
+            )()
+
+        async def text_chat(self, prompt=None, system_prompt=None, model=None, **kwargs):
+            self.calls.append({"prompt": prompt, "model": model})
+            return type("R", (), {"completion_text": '{"t1": {"tags": ["天气"]}}'})()
+
+    class OldProvider:
+        """签名里没有 model、也没有 **kwargs 的老 provider。"""
+
+        async def text_chat(self, prompt=None, system_prompt=None):
+            return type("R", (), {"completion_text": '{"t1": {"tags": ["天气"]}}'})()
+
+    briefs = [ToolBrief(name="t1", description="d")]
+
+    check(provider_supports_model(LegitProvider()), "签名带 model 的 provider 支持覆盖")
+    check(
+        not provider_supports_model(OldProvider()),
+        "签名里没有 model 也没有 **kwargs 的 provider 被正确识别为不支持",
+    )
+
+    # meta() 抛异常不该让描述失败（第三方 provider 常见）
+    info = describe_provider(LegitProvider())
+    check(info["id"] == "cheap-llm" and info["model"] == "default-model", f"描述 provider：{info}")
+    try:
+        describe_provider(FakeProvider())
+        described = True
+    except Exception:  # noqa: BLE001
+        described = False
+    check(described, "meta() 抛异常时 describe_provider 不跟着炸")
+
+    provider = LegitProvider()
+    result = _asyncio.run(enrich(provider, briefs, timeout=5, model="tiny-model"))
+    check(provider.calls[0]["model"] == "tiny-model", "模型覆盖真的传给了 text_chat")
+    check(result.updated.get("t1") is not None, "覆盖模型后照样解析出结果")
+    check(
+        any("tiny-model" in note for note in result.notes),
+        f"结果里说明了实际用的模型：{result.notes}",
+    )
+
+    provider = LegitProvider()
+    _asyncio.run(enrich(provider, briefs, timeout=5))
+    check(provider.calls[0]["model"] is None, "没配模型时不传 model（用 provider 自己的）")
+
+    old = OldProvider()
+    result = _asyncio.run(enrich(old, briefs, timeout=5, model="tiny-model"))
+    check(
+        result.updated.get("t1") is not None,
+        "provider 不支持 model 时仍然完成总结（不因为覆盖失败而整体失败）",
+    )
+    check(
+        any("不支持" in note for note in result.notes),
+        f"并且明确说明覆盖被忽略：{result.notes}",
+    )
+
+
 def test_identifier_splitting() -> None:
     print("retriever / 标识符拆分（修掉 weather 匹配不到 get_weather 的漏洞）")
     from core.retriever import split_identifier
@@ -965,6 +1051,7 @@ def main() -> int:
         test_overrides_store,
         test_tags_drive_retrieval,
         test_enrich_parsing,
+        test_enrich_model_override,
         test_identifier_splitting,
         test_fuzzy_and_single_char,
         test_learning_store,
