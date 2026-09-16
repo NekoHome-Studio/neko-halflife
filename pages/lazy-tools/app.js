@@ -97,6 +97,11 @@ const dom = {
   importTitle: document.getElementById("import-title"),
   importHint: document.getElementById("import-hint"),
   importBody: document.getElementById("import-body"),
+  learningTitle: document.getElementById("learning-title"),
+  learningSummary: document.getElementById("learning-summary"),
+  learningHint: document.getElementById("learning-hint"),
+  learningClearAll: document.getElementById("learning-clear-all"),
+  learningBody: document.getElementById("learning-body"),
   commandsTitle: document.getElementById("commands-title"),
   commandsSummary: document.getElementById("commands-summary"),
   commandsBody: document.getElementById("commands-body"),
@@ -205,6 +210,9 @@ function applyLabels() {
     "支持单个 .py 或含 __init__.py 的 .zip 包；同名已存在时请先删除",
   );
   dom.uploadButton.textContent = t("pages.lazy-tools.install", "安装");
+
+  dom.learningTitle.textContent = t("pages.lazy-tools.learning", "学习与归纳");
+  dom.learningClearAll.textContent = t("pages.lazy-tools.learning_clear", "清空全部学习");
 
   dom.importTitle.textContent = t("pages.lazy-tools.import", "从已装插件导入");
   dom.importHint.textContent = t(
@@ -570,6 +578,7 @@ async function loadState(force = false) {
     if (!force) setBadge(t("pages.lazy-tools.synced", "已同步"), "ok");
     await loadCommands();
     await loadImportCandidates();
+    await loadLearning();
   } catch (error) {
     showError(error?.message || String(error));
     setBadge(t("pages.lazy-tools.failed", "读取失败"), "danger");
@@ -777,6 +786,204 @@ async function enrichTools() {
     } else if (!count) {
       showToast("没有需要补标签的工具（都已有标签）");
     }
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 归纳学习                                                            */
+/* ------------------------------------------------------------------ */
+
+async function loadLearning() {
+  clear(dom.learningBody);
+  let payload;
+  try {
+    payload = await callGet("learning/list");
+  } catch (error) {
+    dom.learningBody.append(
+      el("div", "empty", `读取学习数据失败：${error?.message || error}`),
+    );
+    return;
+  }
+  if (!payload.enabled) {
+    dom.learningBody.append(
+      el(
+        "div",
+        "empty",
+        t(
+          "pages.lazy-tools.learning_off",
+          "归纳学习已关闭（learning_enabled=false）。",
+        ),
+      ),
+    );
+    return;
+  }
+
+  const tools = payload.tools || [];
+  dom.learningSummary.textContent = t(
+    "pages.lazy-tools.learning_summary",
+    "共 {total} 条样例 · 归纳门槛 {min_hits} 条",
+  )
+    .replace("{total}", payload.total)
+    .replace("{min_hits}", payload.min_hits);
+  dom.learningHint.textContent = t(
+    "pages.lazy-tools.learning_hint",
+    "样例来自「模型真的调用了该工具」的那一轮用户原话，检索权重高于作者手写的 examples；归纳会把多条样例里反复出现的词提议成标签",
+  );
+
+  if (!tools.length) {
+    dom.learningBody.append(
+      el(
+        "div",
+        "empty",
+        t(
+          "pages.lazy-tools.learning_empty",
+          "还没有学到任何样例。正常聊天、让模型用上工具之后回来刷新即可。只有本插件注册的工具会被学习。",
+        ),
+      ),
+    );
+    return;
+  }
+
+  const list = el("div", "import-list");
+  for (const item of tools) {
+    const row = el("div", "import-item");
+
+    const head = el("div", "import-head");
+    const title = el("div", "import-title-cell");
+    title.append(
+      el("span", "source-name", item.name),
+      el(
+        "span",
+        "muted",
+        ` ${item.count} ${t("pages.lazy-tools.learning_sample", "条样例")}`,
+      ),
+    );
+    head.append(title);
+
+    const badges = el("div", "import-badges");
+    if ((item.suggested_tags || []).length) {
+      badges.append(
+        el(
+          "span",
+          "badge badge-warn",
+          t("pages.lazy-tools.learning_suggested", "有候选标签"),
+        ),
+      );
+    }
+    if (item.overridden) {
+      badges.append(
+        el(
+          "span",
+          "badge badge-ok",
+          t("pages.lazy-tools.learning_overridden", "已有覆盖"),
+        ),
+      );
+    }
+    head.append(badges);
+    row.append(head);
+
+    const examples = el("div", "learn-examples");
+    for (const text of item.examples) {
+      const chip = el("div", "learn-example");
+      chip.append(el("span", "learn-text", text));
+      const drop = el("button", "learn-drop", "×");
+      drop.type = "button";
+      drop.title = t(
+        "pages.lazy-tools.learning_drop",
+        "删掉这条样例（学错了就删）",
+      );
+      drop.addEventListener("click", () => forgetExample(item.name, text));
+      chip.append(drop);
+      examples.append(chip);
+    }
+    row.append(examples);
+
+    if ((item.suggested_tags || []).length) {
+      const suggest = el("div", "learn-suggest");
+      suggest.append(
+        el(
+          "span",
+          "muted",
+          t("pages.lazy-tools.learning_suggest", "归纳出的候选标签："),
+        ),
+      );
+      for (const tag of item.suggested_tags) {
+        suggest.append(el("span", "tag", tag));
+      }
+      const adopt = el(
+        "button",
+        "btn btn-small btn-primary",
+        t("pages.lazy-tools.learning_adopt", "采纳这些标签"),
+      );
+      adopt.type = "button";
+      adopt.addEventListener("click", () =>
+        inductTags(item.name, item.suggested_tags),
+      );
+      suggest.append(adopt);
+      row.append(suggest);
+    }
+
+    const actions = el("div", "import-actions");
+    const clear = el(
+      "button",
+      "btn btn-small btn-danger",
+      t("pages.lazy-tools.learning_clear_one", "清除该工具的学习"),
+    );
+    clear.type = "button";
+    clear.addEventListener("click", () => clearLearning(item.name));
+    actions.append(clear);
+    row.append(actions);
+
+    list.append(row);
+  }
+  dom.learningBody.append(list);
+}
+
+async function clearLearning(name) {
+  if (busy) return;
+  if (name && !window.confirm(`清除 ${name} 的全部学习样例？`)) return;
+  if (!name && !window.confirm("清空全部学习样例？此操作不可撤销。")) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("learning/clear", name ? { name } : {});
+    showToast(`已清除 ${result.removed} 条学习样例`);
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function forgetExample(name, text) {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    await callPost("learning/forget", { name, text });
+    showToast("已删除这条样例");
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function inductTags(name, tags) {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("learning/induct", { names: [name] });
+    const adopted = result.adopted?.[name] || tags || [];
+    showToast(`${name} 已采纳 ${adopted.length} 个归纳标签`);
     await loadState(true);
   } catch (error) {
     showError(error?.message || String(error));
@@ -1104,6 +1311,7 @@ function bindEvents() {
   dom.searchButton.addEventListener("click", runSearch);
   dom.uploadButton.addEventListener("click", uploadSubplugin);
   dom.enrichButton.addEventListener("click", enrichTools);
+  dom.learningClearAll.addEventListener("click", () => clearLearning(""));
   dom.rescanButton.addEventListener("click", rescanSubplugins);
   dom.queryInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {

@@ -45,6 +45,7 @@ from astrbot.api.web import error_response, json_response, request
 try:
     from .core import enrich, injector, plugin_host, plugin_import, uploads
     from .core.activation import ActivationStore
+    from .core.learning import LEARNING, default_learning_path
     from .core.models import RISK_HIGH, ToolMeta, TurnContext
     from .core.overrides import OVERRIDES, default_override_path
     from .core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -54,6 +55,7 @@ try:
 except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
     from core import enrich, injector, plugin_host, plugin_import, uploads
     from core.activation import ActivationStore
+    from core.learning import LEARNING, default_learning_path
     from core.models import RISK_HIGH, ToolMeta, TurnContext
     from core.overrides import OVERRIDES, default_override_path
     from core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -96,6 +98,7 @@ class LazyToolsPlugin(Star):
         self._hosted: dict[str, Any] = {}
         #: 工具元数据覆盖（手动改的标签/描述 + LLM 总结结果），落盘在插件数据目录
         OVERRIDES.path = default_override_path(PLUGIN_NAME)
+        LEARNING.path = default_learning_path(PLUGIN_NAME)
         self._apply_config(config)
         self._register_web_apis()
 
@@ -112,6 +115,8 @@ class LazyToolsPlugin(Star):
         # 覆盖项要在建索引之前施加，否则检索用的是被冲回基线的元数据
         OVERRIDES.load()
         OVERRIDES.apply_all(REGISTRY)
+        LEARNING.max_examples = self._learning_max
+        LEARNING.load()
         await self._load_sub_plugins()
         OVERRIDES.apply_all(REGISTRY)
         self._rebuild_index()
@@ -188,8 +193,11 @@ class LazyToolsPlugin(Star):
 
         # 3) 本地预检索 -> 自动激活。不调用 LLM。
         hits: list[tuple[ToolMeta, float]] = []
+        turn_query = (
+            getattr(req, "prompt", None) or event.message_str or ""
+        ).strip()
         if self._prefetch_enabled and self.index.size:
-            query = (getattr(req, "prompt", None) or event.message_str or "").strip()
+            query = turn_query
             if query:
                 for meta, score in self.index.search(
                     query, top_k=self._top_k, min_score=self._min_score
@@ -224,6 +232,8 @@ class LazyToolsPlugin(Star):
             allowed=allowed,
             lazy_allowed=lazy_allowed,
             pruned=pruned,
+            # 记下这句话：归纳学习要用它把"用户怎么说的"与"模型选了什么工具"关联起来
+            query=turn_query,
             created_at=time.monotonic(),
         )
         self._gc_turns()
@@ -238,6 +248,107 @@ class LazyToolsPlugin(Star):
                 active or "无",
                 removed,
             )
+
+    # ------------------------------------------------------------------
+    # 归纳学习：观察"模型真的用了哪个工具"，反推"用户会怎么说"
+    # ------------------------------------------------------------------
+
+    @filter.on_using_llm_tool()
+    async def on_using_llm_tool(
+        self,
+        event: AstrMessageEvent,
+        tool: Any = None,
+        tool_args: Any = None,
+    ) -> None:
+        """模型真的调用了一个工具 —— 这是"这句说法与这个工具相关"的最强证据。
+
+        只学本插件注册表认得的工具（``REGISTRY.get``），不去学别人的工具。
+        """
+        if not self._learning_enabled:
+            return
+        name = str(getattr(tool, "name", "") or "")
+        if not name or REGISTRY.get(name) is None:
+            return
+        turn = self._turns.get(event.unified_msg_origin)
+        query = turn.query if turn else ""
+        if not query:
+            return
+        if LEARNING.record(name, query):
+            LEARNING.save()
+            # 可选：达到门槛的候选标签直接采纳（默认关闭，见 auto_induct_tags）
+            self._maybe_auto_induct(name)
+            # 立刻重建索引：新学到的说法本轮之后就能参与召回
+            self._rebuild_index()
+            logger.debug("[neko-halflife] 学到一条样例：%s ← %s", name, query[:40])
+
+    def _maybe_auto_induct(self, name: str) -> list[str]:
+        """自动采纳归纳标签（``auto_induct_tags=true`` 时才动）。
+
+        默认关闭是有意的：标签直接决定召回，而自动采纳等于**让插件自己修改自己的
+        召回依据**——一旦归纳出的词是噪声，它会持续把不相关的请求导向这个工具，
+        而且看起来像是"插件自己变聪明了"，很难排查。开着的时候也有 ``induction_min_hits``
+        兜底（同一个词必须出现在多条**不同**样例里）。
+        """
+        if not self._auto_induct_tags:
+            return []
+        meta = REGISTRY.get(name)
+        if meta is None:
+            return []
+        suggestions = LEARNING.suggest_tags(
+            name, meta.tags, min_hits=self._induct_min_hits
+        )
+        if not suggestions:
+            return []
+        merged = list(dict.fromkeys([*meta.tags, *suggestions]))
+        OVERRIDES.set(name, tags=merged, source="manual")
+        OVERRIDES.apply_all(REGISTRY)
+        OVERRIDES.save()
+        logger.info(
+            "[neko-halflife] 自动采纳归纳标签（auto_induct_tags）：%s += %s",
+            name,
+            suggestions,
+        )
+        return suggestions
+
+    @filter.on_llm_tool_respond()
+    async def on_llm_tool_respond(
+        self,
+        event: AstrMessageEvent,
+        tool: Any = None,
+        tool_args: Any = None,
+        tool_result: Any = None,
+    ) -> None:
+        """工具调用结果回来 → 若明确失败，给对应的学习样例记一次负反馈。
+
+        这里有两个**必须写清楚**的坑，否则这段代码会做成负优化：
+
+        1. ``tool_result is None`` **不等于失败**。AstrBot 的 runner 用
+           ``_final_resp`` 记录结果，工具"不返回值、直接发消息给用户"时它
+           仍然是 ``None``，而这是**成功**路径（``_transition_state(DONE)``）。
+           把它当失败会让"发消息类"工具每用一次就把刚学到的样例抹掉。
+        2. 本地工具**抛异常时这个钩子根本不会被调用**：异常从
+           ``ToolExecutor._execute_local`` 冒泡到 runner 的
+           ``except Exception``（在 ``on_tool_end`` 调用点之外），钩子直接跳过。
+           所以 ``isError`` 才是唯一可靠的失败标志——而 AstrBot 4.26/4.27 的
+           本地工具路径**从不设置**它（只有 MCP 服务端会设）。
+
+        结论：这条自动负反馈目前基本是**为未来/为 MCP 预留**的。真正能兜底的
+        是人工纠正——WebUI「学习与归纳」面板可以逐条删除样例
+        （``learning/forget``），以及清空重学（``learning/clear``）。
+        """
+        if not self._learning_enabled:
+            return
+        if not bool(getattr(tool_result, "isError", False)):
+            return
+        name = str(getattr(tool, "name", "") or "")
+        if not name or REGISTRY.get(name) is None:
+            return
+        turn = self._turns.get(event.unified_msg_origin)
+        query = turn.query if turn else ""
+        if query and LEARNING.record_failure(name, query):
+            LEARNING.save()
+            self._rebuild_index()
+            logger.debug("[neko-halflife] 学习样例记一次负反馈：%s ← %s", name, query[:40])
 
     # ------------------------------------------------------------------
     # 元工具：预检索没命中时的兜底
@@ -444,6 +555,10 @@ class LazyToolsPlugin(Star):
             ("tools/update", self.page_update_tool, ["POST"], "手动修改工具的标签与描述"),
             ("tools/reset", self.page_reset_tool, ["POST"], "撤销工具的手动覆盖"),
             ("tools/enrich", self.page_enrich_tools, ["POST"], "用 LLM 总结工具描述与标签"),
+            ("learning/list", self.page_learning_list, ["GET"], "查看学习样例与归纳出的候选标签"),
+            ("learning/clear", self.page_learning_clear, ["POST"], "清除学习样例"),
+            ("learning/forget", self.page_learning_forget, ["POST"], "删除一条学错的样例"),
+            ("learning/induct", self.page_learning_induct, ["POST"], "采纳归纳出的候选标签"),
         )
         for suffix, handler, methods, description in routes:
             try:
@@ -1429,6 +1544,126 @@ class LazyToolsPlugin(Star):
         result = await self._enrich_tools(names, only_missing=only_missing)
         return json_response(result)
 
+    # ---- 归纳学习：查看、清除、采纳候选标签 ------------------------------
+
+    async def page_learning_list(self):
+        """列出各工具学到的样例，以及从样例里归纳出的候选标签。"""
+        tools = []
+        for meta in sorted(REGISTRY.all(), key=lambda item: item.name):
+            examples = LEARNING.examples(meta.name)
+            if not examples:
+                continue
+            tools.append(
+                {
+                    "name": meta.name,
+                    "source": meta.source,
+                    "examples": examples,
+                    "count": len(examples),
+                    "tags": list(meta.tags),
+                    "suggested_tags": LEARNING.suggest_tags(
+                        meta.name, meta.tags, min_hits=self._induct_min_hits
+                    ),
+                    "overridden": OVERRIDES.get(meta.name) is not None,
+                }
+            )
+        return json_response(
+            {
+                "enabled": self._learning_enabled,
+                "total": LEARNING.count(),
+                "min_hits": self._induct_min_hits,
+                "auto_induct": self._auto_induct_tags,
+                "tools": tools,
+            }
+        )
+
+    async def page_learning_clear(self):
+        """清除学习样例（全部或指定工具）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        name = str(payload.get("name") or "").strip()
+        removed = LEARNING.clear(name or None)
+        LEARNING.save()
+        self._rebuild_index()
+        return json_response(
+            {
+                "name": name or "*",
+                "removed": removed,
+                "total": LEARNING.count(),
+                "indexed": self.index.size,
+            }
+        )
+
+    async def page_learning_forget(self):
+        """删除某工具下的一条具体样例（人工纠正）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        name = str(payload.get("name") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        if not name or not text:
+            return error_response("需要同时提供 name 与 text。")
+        if not LEARNING.forget(name, text):
+            return error_response("没找到这条样例（可能已被删除）。")
+        LEARNING.save()
+        self._rebuild_index()
+        return json_response(
+            {
+                "name": name,
+                "text": text,
+                "count": len(LEARNING.examples(name)),
+                "total": LEARNING.count(),
+            }
+        )
+
+    async def page_learning_induct(self):
+        """把归纳出的候选标签采纳为标签。
+
+        采纳是**明确的用户动作**，所以写成 ``source="manual"`` 的覆盖——
+        与用户手改等价，LLM 总结不会把它冲掉。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        raw_names = payload.get("names")
+        only = (
+            {str(item).strip() for item in raw_names if str(item).strip()}
+            if isinstance(raw_names, list)
+            else None
+        )
+        only_tags = payload.get("tags")
+        wanted = (
+            {str(item).strip() for item in only_tags if str(item).strip()}
+            if isinstance(only_tags, list)
+            else None
+        )
+
+        adopted: dict[str, list[str]] = {}
+        for meta in REGISTRY.all():
+            if only is not None and meta.name not in only:
+                continue
+            suggestions = LEARNING.suggest_tags(
+                meta.name, meta.tags, min_hits=self._induct_min_hits
+            )
+            if wanted is not None:
+                suggestions = [tag for tag in suggestions if tag in wanted]
+            if not suggestions:
+                continue
+            merged = list(dict.fromkeys([*meta.tags, *suggestions]))
+            OVERRIDES.set(meta.name, tags=merged, source="manual")
+            adopted[meta.name] = suggestions
+
+        if adopted:
+            OVERRIDES.apply_all(REGISTRY)
+            OVERRIDES.save()
+            LEARNING.save()
+            self._rebuild_index()
+            logger.info(
+                "[neko-halflife] 已采纳归纳标签：%s",
+                {name: tags for name, tags in list(adopted.items())[:5]},
+            )
+        return json_response({"adopted": adopted, "tools": sorted(adopted)})
+
     # ------------------------------------------------------------------
     # 内部工具方法
     # ------------------------------------------------------------------
@@ -1453,6 +1688,10 @@ class LazyToolsPlugin(Star):
         self._llm_enrich = bool(get("llm_enrich_on_import", True))
         self._llm_enrich_max = max(int(get("llm_enrich_max_tools", 20) or 0), 0)
         self._llm_enrich_timeout = max(float(get("llm_enrich_timeout", 60) or 0.0), 5.0)
+        self._learning_enabled = bool(get("learning_enabled", True))
+        self._learning_max = max(int(get("learning_max_examples", 20) or 1), 1)
+        self._induct_min_hits = max(int(get("induction_min_hits", 3) or 1), 1)
+        self._auto_induct_tags = bool(get("auto_induct_tags", False))
         self._debug = bool(get("debug", False))
         self._search_top_k = max(self._top_k, 5) if self._top_k else 5
 
@@ -1606,6 +1845,9 @@ class LazyToolsPlugin(Star):
         return REGISTRY.forget_source(source)
 
     def _rebuild_index(self) -> None:
+        # 学习样例先进 meta，再建索引——否则新学到的说法要等到下次重建才生效
+        if self._learning_enabled:
+            LEARNING.apply(REGISTRY)
         self.index.build(REGISTRY.candidates())
 
     def _lazy_pool(self, umo: str) -> frozenset[str]:

@@ -5,3 +5,10 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+
+# 打包（git archive）时要排除的开发侧文件。
+# 打包命令因此可以简单到 `git archive -o dist/<name>-<ver>.zip HEAD`，
+# 不用手写文件清单——手写清单迟早会漏掉新加的文件（core/learning.py 就是例子）。
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/dist export-ignore

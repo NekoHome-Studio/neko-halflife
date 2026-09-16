@@ -38,6 +38,14 @@ class ToolMeta:
     examples: tuple[str, ...] = ()
     """示例说法，用于把用户口语映射到工具。"""
 
+    learned: tuple[str, ...] = ()
+    """从实际使用中归纳出来的查询样例（见 :mod:`core.learning`）。
+
+    与 ``examples`` 的区别：``examples`` 是作者**猜**用户会怎么说；
+    ``learned`` 是"用户真的这么说、而且模型真的选了这个工具"的**实证**，
+    所以检索权重比 ``examples`` 高。
+    """
+
     group: str | None = None
     """工具分组名，检索时按组加权，也便于将来做「一次激活整组」。"""
 
@@ -64,6 +72,8 @@ class ToolMeta:
             "tags": " ".join(self.tags),
             "examples": " ".join(self.examples),
         }
+        if self.learned:
+            fields["learned"] = " ".join(self.learned)
         if self.group:
             fields["group"] = self.group
         return fields
@@ -93,6 +103,9 @@ class TurnContext:
 
     pruned: dict[str, Any] = field(default_factory=dict)
     """本轮被裁掉的工具对象（``name -> FunctionTool``），供元工具原样补回。"""
+
+    query: str = ""
+    """本轮用户的原始输入。归纳学习要用它把"这句话"与"被调用的工具"关联起来。"""
 
     created_at: float = 0.0
     """快照创建时间，用于清理陈旧的会话快照。"""

@@ -19,11 +19,14 @@ AstrBot 默认会把**所有**已注册工具的完整 JSON Schema 一次性放�
 
 ```
 第 1 步  本地预检索    用用户输入查关键词/标签索引，纯本地计算，不调用 LLM
+                       （标识符拆词 + 中文 bigram + 错拼近似 + 单字兜底 + 学习样例）
 第 2 步  激活表管理    per-UMO 激活表，轮次衰减 + 时间过期双过期
 第 3 步  Schema 注入   许可池快照 ∩ 激活表，重建本轮 ToolSet
 第 4 步  LLM 调用      模型看到的与普通 function calling 完全一致
 第 5 步  统一执行      校验/执行/错误回传交给 AstrBot runner；本插件只做
                        结果裁剪（max_result_chars），不做重复的权限判定
+第 6 步  归纳学习      模型真的用了哪个工具，就把那一轮的用户原话记成该工具的
+                       学习样例，下轮起参与召回；反复出现的词会被提议成标签
 ```
 
 ---
@@ -141,6 +144,33 @@ async def get_weather(self, event: AstrMessageEvent, city: str) -> str:
 | `risk="high"` | 高风险：不会被预检索自动激活，只能由模型显式激活 |
 | `max_result_chars` | 覆盖全局结果裁剪长度 |
 
+#### 检索是怎么匹配的
+
+召回不看模型，只看一张倒排表。索引里每个工具贡献五个字段，权重不同：
+
+| 字段 | 权重 | 来源 |
+|---|---|---|
+| 工具名 | 3.0 | `@lazy_tool` / `@filter.llm_tool` 的名字 |
+| `tags` | 2.5 | 作者写的，或 WebUI 手改/LLM 总结/归纳采纳的 |
+| 学习样例 | 2.2 | **实测**：模型真的用过这个工具的那句用户原话 |
+| `group` | 2.0 | 分组名 |
+| `examples` | 1.5 | 作者猜用户会怎么说 |
+| 描述 | 1.0 | docstring 摘要 |
+
+查询侧做了这几层处理：
+
+* **标识符拆词**：`get_weather` 同时进 `get_weather`、`get`、`weather` 三个词。
+  没有这一层，用户说「weather」永远召不回 `get_weather`——这是最隐蔽的一类漏召回；
+* **中文 bigram**：`帮我查天气` 切成 `帮我/我查/查天/天气`，不需要分词器；
+* **单字兜底**（0.4 权重）：再收录每个汉字，让「冷」这种一字查询有机会命中；
+* **错拼近似**：长度 ≥5 的纯字母词允许编辑距离 1（`wether` → `weather`），
+  但整条分数乘以 0.6 置信折扣——**只靠拼写猜中的分数必须真的低于拼中**，
+  否则 `min_score` 对它形同虚设；
+* **信息词分母**：只有真的出现在倒排表里的词才进分母。中文长句会被切成大量
+  无意义 bigram，把它们算进分母会把真正命中的词稀释到阈值以下。
+
+分数 = `0.65 × 覆盖率 + 0.35 × 强度`，落在 `[0,1]`，可解释、可试跑。
+
 ### 2. 子插件：插件里装工具集
 
 ```
@@ -199,6 +229,8 @@ sub_plugins/
 * **子插件开关**：在线启停 `sub_plugins/` 下的工具集，状态会写回插件配置；
 * **上传子插件**：上传一个 `.py` 或 `.zip` 直接装进 `sub_plugins/` 并立即加载；
 * **从已装插件导入**：把 `data/plugins/` 下某个插件的源码复制进 `sub_plugins/`；
+* **学习与归纳**（见下节）：看每个工具学到了哪些用户原话、候选标签是什么，
+  可逐条删除样例、清空重学、一键采纳候选标签；
 * **指令面板**（默认关闭）：列出全部指令，支持改指令名/别名、启停、权限、冲突查看。
 
 页面通过 `window.AstrBotPluginPage` bridge 与 WebUI 外壳通信，主题跟随 WebUI
@@ -360,6 +392,43 @@ core 内部模块而非 `astrbot.api` 公开接口，所以采用**容错导入*
 > 而不是 `permission`，且只接受 `admin` / `member`（`everyone` 会被拒），
 > 所以插件按位置传参并预先校验取值。
 
+### 6. 归纳学习：让工具自己学会「用户会怎么说」
+
+作者写得出 `tags`，但写不出所有用户的口语。「导入进来的外来工具」更糟——
+它只有原始名字和一串英文描述，中文用户怎么说它，谁也不知道。
+
+本插件用 AstrBot 的两个工具级钩子把这件事变成实证：
+
+```
+用户说了什么（_decide 时记进 TurnContext）
+      ↓ 模型真的调用了工具 X（@filter.on_using_llm_tool）
+把「那句话 → X」记成 X 的学习样例，并进入检索索引
+      ↓ 同类说法反复出现（induction_min_hits 条不同样例里都有同一个词）
+      ↓ 归纳提议成标签 → 面板上一键采纳（或 auto_induct_tags 自动采纳）
+那句话以后就能召回 X
+```
+
+* **为什么可信**：不是猜的。一句话**真的导致**某个工具被调用，说明这句话与该工具
+  确实相关——权重（2.2）因此排在作者手写的 `examples`（1.5）之上；
+* **为什么不会学坏**：只学**本插件注册表认得**的工具（不去学别人的工具）；
+  样例有长度与数量上限（超限保留命中最多的）；归纳按「出现在多少条**不同**样例里」
+  计数，同一句话里重复三遍不算三次证据；只提议长度 ≥2 的词。
+
+**关于自我纠错，有一个必须说清楚的现实**：设计上 `@filter.on_llm_tool_respond`
+会用 `isError` 给失败的调用记负反馈，但 AstrBot 4.26/4.27 里——
+
+* 本地工具**抛异常时这个钩子根本不会被调用**（异常在 runner 的 `except` 里被接住，
+  位置在 `on_tool_end` 调用点之外）；
+* 返回值是 `None` 也**不是失败**：那是「工具直接发消息给用户」的**成功**路径；
+* 本地工具路径**从不设置** `isError`（只有 MCP 服务端会设）。
+
+所以自动负反馈目前基本是「为未来 / 为 MCP 预留」。真正能兜底的是人：
+面板里每条样例右边都有一个 `×`，学错了直接删；或者整个工具清空重学。
+**自学习的功能如果不可纠正，就不该上线。**
+
+归纳采纳写的是 `source="manual"` 的覆盖，与手动改标签等价——
+LLM 总结不会把它冲掉，重启后依然在。
+
 ---
 
 ## 配置项
@@ -384,6 +453,10 @@ core 内部模块而非 `astrbot.api` 公开接口，所以采用**容错导入*
 | `llm_enrich_on_import` | true | 导入/上传后用 LLM 总结标签与描述。会消耗 token，失败只跳过 |
 | `llm_enrich_max_tools` | 20 | 单次最多总结几个工具；`0` 表示关闭 LLM 总结 |
 | `llm_enrich_timeout` | 60 | LLM 总结超时（秒）；超时跳过，不会卡住导入 |
+| `learning_enabled` | true | 归纳学习总开关；关闭后不再采样，也不参与检索 |
+| `learning_max_examples` | 20 | 单个工具最多保留多少条学习样例（超出时保留命中最多的） |
+| `induction_min_hits` | 3 | 一个词至少在多少条**不同**样例里出现，才会被提议成标签 |
+| `auto_induct_tags` | false | 自动采纳候选标签。默认关闭：自动改标签属于「自己改自己的召回依据」，应由人拍板 |
 
 > `sub_plugins_disabled` 存的是停用名单而不是启用名单：启用名单里的空列表无法
 > 区分「一个都不启用」和「留空 = 全部启用」，会把「全停」静默变成「全开」。
@@ -469,6 +542,15 @@ req.func_tool = 许可池中 (非本插件工具 ∪ keep)
   工具数量只有十几个时，收益可能不足以覆盖复杂度。
 * **不持久化**。激活表是内存态，重启即清空（设计上也就该如此，它描述的是
   「最近几轮在聊什么」）。子插件启停状态来自配置，重启后按配置恢复。
+  **例外**：工具标签覆盖（`tool_overrides.json`）与学习样例
+  （`learned_examples.json`）落在 AstrBot 的插件数据目录里，重启不丢。
+* **学习需要模型真的用过工具**。如果预检索从来没激活过某个工具、模型也从来没
+  调用过它，就不会有任何样例——这是「实证学习」的代价，不是 bug。
+* **`on_llm_tool_respond` 的负反馈目前基本不生效**（AstrBot 不设 `isError`、
+  工具抛异常时钩子不被调用），纠错以人工删除样例为主，见上文「归纳学习」。
+* **宿主模式会执行外来插件的 `__init__`**。被导入的插件与原生加载互不影响，
+  但若原插件仍然启用，两者会各持有一个实例（工具名相同，仍按名字裁剪，
+  所以懒加载语义不会被破坏）。
 
 ---
 
@@ -477,10 +559,11 @@ req.func_tool = 许可池中 (非本插件工具 ∪ keep)
 两层测试，都不需要启动 AstrBot：
 
 ```bash
-# 1) 纯逻辑自检：检索、双过期、裁剪、上传与导入分析、覆盖层与总结解析（无依赖，141 项）
+# 1) 纯逻辑自检：检索、双过期、裁剪、上传与导入分析、覆盖层、总结解析、归纳学习
+#    （无依赖，180 项）
 python tests/selftest.py
 
-# 2) 集成冒烟：真机验证注册契约、Web API、宿主模式与工具标签（195 项）
+# 2) 集成冒烟：真机验证注册契约、Web API、宿主模式、工具标签与归纳学习（231 项）
 #    需要能 import astrbot；用 ASTRBOT_SRC 指定源码根目录
 #    （刻意不用 ASTRBOT_ROOT——那是 AstrBot 自己的运行根目录变量）
 python tests/smoke_astrbot.py
@@ -494,10 +577,17 @@ python tests/smoke_astrbot.py
   断言它被拒绝、**且没有写出任何文件**、也没留下半个子插件；
 * `test_tags_drive_retrieval` 直接证明本功能的因果：同一个工具、同一句口语查询，
   补标签前**召回不到**、补标签后**能召回**——这就是"标签值得改"的证据。
+* `test_learning_improves_recall` 证明归纳学习的因果：同一句话，学之前
+  **召回不到**、学之后**能召回**；
+* `test_identifier_splitting` / `test_fuzzy_and_single_char` 锁住几类具体漏召回：
+  「weather」召不回 `get_weather`、拼错一个字母召不回、单字查询召不回；
+  同时断言**拼错的分数确实低于拼对的**（折扣不能是摆设）。
 
 `tests/smoke_astrbot.py` 会真的导入 AstrBot、真的构造 `ToolSet` 与 `FunctionTool`、
-真的跑一遍 `_decide()` 和全部 16 个 Page 接口，并校验 Page 目录与 i18n 文件齐备。
-其中四处是端到端的：
+真的跑一遍 `_decide()` 和全部 17 个 Page 接口，并校验 Page 目录与 i18n 文件齐备
+（含一条**结构性**检查：前端 `t("pages.lazy-tools.X")` 用到的每个键，
+两个语言文件里都必须真的有——缺了只会静默退回中文兜底，肉眼看不出来）。
+其中五处是端到端的：
 
 * **宿主模式**：造一个真实的常规插件（`Star` 子类 + `@filter.llm_tool` + `@filter.command`）
   走一遍导入，断言实例被创建、工具与命令都被绑定、**并且真的调用成功**
@@ -507,6 +597,9 @@ python tests/smoke_astrbot.py
   能拦下它、清掉脏注册并回滚目录；
 * **标签与总结**：用假 provider 验证手动改标签能生效并**立刻改变召回**、
   LLM 结果不覆盖手改、重置退回基线、取不到模型时只报错不崩；
+* **归纳学习**：真调一遍两个工具钩子，断言 `tool_result=None` **不算失败**、
+  `isError=True` 才作废样例，`learning/forget` 能删掉单条、`auto_induct_tags`
+  默认关闭而开启后生效；
 * **上传 → 删除**：走两条删除路径（能清全局表时遗忘；清不掉时退休兜底）。
 
 这些都用 scratch 目录（不污染仓库）。它把 AstrBot 的 `data/` 重定向到插件目录内的
@@ -522,6 +615,9 @@ python tests/smoke_astrbot.py
 * `_plugin_tool_fix` 是否仍在该钩子之前执行；
 * `ToolSet` 的 `tools` / `add_tool` / `remove_tool` 接口；
 * `filter.llm_tool` 是否仍从 docstring 的 `Args:` 段解析参数；
+* `on_using_llm_tool` / `on_llm_tool_respond` 是否仍在工具调用前后触发，
+  **以及 `on_tool_end` 是否仍排在异常处理之外**（决定了学习负反馈是否可自动生效）；
+* 本地工具路径是否仍不设置 `CallToolResult.isError`；
 * Page 是否仍只扫 `pages/<name>/index.html`，以及前端拼路由是否仍是
   `/api/v1/plugins/extensions/<metadata.name>/<endpoint>`。
 
@@ -531,7 +627,7 @@ python tests/smoke_astrbot.py
 
 | AstrBot | 核对方式 | 结果 |
 |---|---|---|
-| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与全部 16 个 Page 接口，含宿主模式与 LLM 总结端到端），336 项断言全绿 | 全部成立 |
+| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与全部 17 个 Page 接口，含宿主模式、LLM 总结与归纳学习端到端），411 项断言全绿 | 全部成立 |
 | **4.27.4** | 按上面五条逐条比对 tag `v4.27.4` 源码 | 全部成立 |
 
 4.27.4 的差异都落在本插件不依赖的地方：provider 选择改为 `get_using_provider_async`、
@@ -540,6 +636,8 @@ TTS 查询改为 `get_using_tts_provider_async`、`_select_provider` 变成 `asy
 的**代码行与 4.26.7 完全一致**（仅一处中文 docstring 措辞变化），
 `astrbot/dashboard/services/plugin_page_service.py` 的**整文件哈希一致**。
 `provider_settings.tool_schema_mode` 的 `skills_like|full` 两个选项也仍在。
+`astrbot/core/agent/runners/tool_loop_agent_runner.py` 里 `on_tool_end` 的调用点
+仍在内层 `try` 之外（即工具抛异常时不会触发该钩子），与上文「归纳学习」的描述一致。
 
 > 未核对：**4.28.x**。4.28.0 把「Agent 执行器」配置从模型提供商页移进了配置文件页
 > （`#9821`），并提到工具 Schema 顺序按名字排序（`#9798`）——前者与本插件

@@ -26,6 +26,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import types
@@ -446,6 +447,19 @@ def main() -> int:
         check(bool(page_i18n.get("title")), f"{locale} 提供 pages.lazy-tools.title")
         check(bool(page_i18n.get("description")), f"{locale} 提供 pages.lazy-tools.description")
 
+    # 前端每个 t("pages.lazy-tools.X", ...) 都必须在两个语言文件里真的有 X。
+    # 少了只会静默退回中文兜底 —— 英文用户看到中文，而且没人会发现。
+    # （本次就是靠这个检查发现 tools_hint / enrich 两个键漏了。）
+    app_source = (page_dir / "app.js").read_text(encoding="utf-8")
+    used_keys = set(re.findall(r't\(\s*"pages\.lazy-tools\.([A-Za-z0-9_]+)"', app_source))
+    check(len(used_keys) >= 20, f"从 app.js 提取到 {len(used_keys)} 个 i18n 键")
+    for locale in ("zh-CN", "en-US"):
+        i18n_path = PLUGIN_ROOT / ".astrbot-plugin" / "i18n" / f"{locale}.json"
+        page_i18n = json.loads(i18n_path.read_text(encoding="utf-8"))
+        page_i18n = page_i18n.get("pages", {}).get("lazy-tools", {})
+        missing = sorted(key for key in used_keys if not page_i18n.get(key))
+        check(not missing, f"{locale} 覆盖了前端用到的全部键（缺：{missing}）")
+
     print()
     print("12. metadata 与代码常量一致（改名时最容易漏的地方）")
     import yaml
@@ -476,6 +490,24 @@ def main() -> int:
     check(
         str(meta.get("astrbot_version", "")).strip() != "",
         "metadata.astrbot_version 已声明",
+    )
+
+    # 配置项与代码必须双向对应。这一条是被真实的坑逼出来的：auto_induct_tags
+    # 曾经只被读出来、在面板上显示，却从来没有被用过——一个"看起来有、实际没有"
+    # 的开关比没有这个开关更糟。反向也一样：代码里读了 schema 里没有的键，
+    # AstrBot 永远不会传给它，默认值会静默接管。
+    schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    schema_keys = {key for key in schema if not key.startswith("$")}
+    main_source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
+    apply_body = main_source.split("def _apply_config", 1)[1].split("\n    def ", 1)[0]
+    read_keys = set(re.findall(r'get\(\s*"([A-Za-z0-9_]+)"', apply_body))
+    check(
+        not (schema_keys - read_keys),
+        f"schema 里每个配置项都真的被读取（未读：{sorted(schema_keys - read_keys)}）",
+    )
+    check(
+        not (read_keys - schema_keys),
+        f"代码读的每个配置项都在 schema 里（多余：{sorted(read_keys - schema_keys)}）",
     )
 
     print()
@@ -1220,6 +1252,268 @@ def main() -> int:
         OVERRIDES.path = None
         plugin._rebuild_index()
         shutil.rmtree(scratch, ignore_errors=True)
+
+    print("17. 归纳学习：钩子注册、学习闭环、人工纠正")
+
+    from astrbot.core.star.star_handler import EventType, star_handlers_registry
+
+    learning_mod = importlib.import_module(f"{PKG_ALIAS}.core.learning")
+    LEARNING = learning_mod.LEARNING
+
+    hook_events = {
+        handler.event_type
+        for handler in star_handlers_registry.get_handlers_by_module_name(
+            f"{PKG_ALIAS}.main"
+        )
+    }
+    check(
+        EventType.OnUsingLLMToolEvent in hook_events,
+        "@filter.on_using_llm_tool 已进入 AstrBot 事件表（不是只写了个装饰器）",
+    )
+    check(
+        EventType.OnLLMToolRespondEvent in hook_events,
+        "@filter.on_llm_tool_respond 已进入 AstrBot 事件表",
+    )
+
+    learn_dir = PLUGIN_ROOT / ".selftest-scratch" / "smoke-learning"
+    shutil.rmtree(learn_dir, ignore_errors=True)
+    learn_dir.mkdir(parents=True, exist_ok=True)
+    real_learn_path = LEARNING.path
+    real_learn_max = LEARNING.max_examples
+    real_learn_override_path = OVERRIDES.path
+    real_ctx3 = plugin.context
+    LEARNING.path = learn_dir / "learned_examples.json"
+    OVERRIDES.path = learn_dir / "tool_overrides.json"
+    LEARNING.max_examples = 20
+    LEARNING.clear()
+    try:
+        registered6: list[tuple[str, list[str]]] = []
+
+        class FakeContext6:
+            def register_web_api(self, route, handler, methods, description):
+                registered6.append((route, list(methods)))
+
+            def get_llm_tool_manager(self):
+                return llm_tools
+
+        plugin.context = FakeContext6()
+        plugin._register_web_apis()
+        routes6 = dict(registered6)
+        for suffix, method in (
+            ("learning/list", "GET"),
+            ("learning/clear", "POST"),
+            ("learning/forget", "POST"),
+            ("learning/induct", "POST"),
+        ):
+            route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+            check(routes6.get(route) == [method], f"注册了路由 {route} [{method}]")
+
+        # 专门造一个"活着"的工具当被测对象：前面小节把 demo_tools 的目录删掉了，
+        # 那个来源已经被退休（定义还在，但永不参与检索），不适合用来证明"学到了"。
+        probe = "learn_probe_tool"
+        REGISTRY.register(
+            ToolMeta(
+                name=probe,
+                description="probe tool",
+                module="smoke.learn",
+                source="smoke_learn",
+            )
+        )
+        plugin._rebuild_index()
+
+        # 选一句"现有工具全都匹配不上"的口语，用来证明学习确实带来了新召回
+        phrase = "帮我订一张去上海的机票"
+
+        # 造一个真实的 FunctionTool 放进本轮工具集：_decide 的许可池就是从这里来的，
+        # 工具不在池子里的话 _decide 会提前返回，压根不会记下本轮原话。
+        probe_ft = FunctionTool(
+            name=probe,
+            description="probe tool",
+            parameters={"type": "object", "properties": {}},
+            handler=None,
+        )
+        toolset6 = ToolSet()
+        toolset6.add_tool(probe_ft)
+        for meta_name in ("lazy_search_tools", "lazy_activate_tool", "lazy_deactivate_tool"):
+            if meta_name in real:
+                toolset6.add_tool(real[meta_name])
+        event6 = types.SimpleNamespace(
+            unified_msg_origin="aiocqhttp:GroupMessage:learn",
+            message_str=phrase,
+        )
+
+        check(
+            plugin.index.search(phrase, top_k=3, min_score=0.35) == [],
+            f"学之前「{phrase}」召回不到任何工具",
+        )
+
+        request6 = types.SimpleNamespace(prompt=phrase, func_tool=toolset6)
+        plugin._decide(event6, request6)
+        turn = plugin._turns.get(event6.unified_msg_origin)
+        check(
+            turn is not None and turn.query == phrase,
+            f"本轮用户原话被记进 TurnContext：{turn and turn.query}",
+        )
+
+        probe_tool = probe_ft
+
+        # ---- 模型真的调用了这个工具：这是学习信号 ----
+        asyncio.run(plugin.on_using_llm_tool(event6, probe_tool, {"text": "x"}))
+        check(
+            LEARNING.examples(probe) == [phrase],
+            f"钩子把（原话 → 工具）记成样例：{LEARNING.examples(probe)}",
+        )
+        check(
+            (learn_dir / "learned_examples.json").is_file(),
+            "学习数据已落盘（重启不丢）",
+        )
+        hits = plugin.index.search(phrase, top_k=3, min_score=0.35)
+        check(
+            bool(hits) and hits[0][0].name == probe,
+            f"学完之后同一句话能召回该工具：{[(m.name, round(s, 3)) for m, s in hits]}",
+        )
+
+        # ---- 别人的工具不该被学 ----
+        alien = FunctionTool(
+            name="astrbot_file_read_tool",
+            description="别人的工具",
+            parameters={"type": "object", "properties": {}},
+            handler=None,
+        )
+        asyncio.run(plugin.on_using_llm_tool(event6, alien, None))
+        check(
+            LEARNING.examples("astrbot_file_read_tool") == [],
+            "只学本插件注册表认得的工具，不去学别人的",
+        )
+
+        # ---- tool_result=None 是成功路径，绝不能当成失败 ----
+        asyncio.run(plugin.on_llm_tool_respond(event6, probe_tool, None, None))
+        check(
+            LEARNING.examples(probe) == [phrase],
+            "结果为空（工具直接发消息给用户）不算失败，样例保留",
+        )
+
+        # ---- isError=True 才算失败：命中 2 次才抵消掉 ----
+        asyncio.run(plugin.on_using_llm_tool(event6, probe_tool, {"text": "x"}))
+        failed_result = types.SimpleNamespace(isError=True)
+        asyncio.run(plugin.on_llm_tool_respond(event6, probe_tool, None, failed_result))
+        check(
+            LEARNING.examples(probe) == [phrase],
+            "命中 2 次、失败 1 次，样例还在",
+        )
+        asyncio.run(plugin.on_llm_tool_respond(event6, probe_tool, None, failed_result))
+        check(
+            LEARNING.examples(probe) == [],
+            "失败次数追平命中次数后样例作废（学错了会自我修正）",
+        )
+        check(
+            plugin.index.search(phrase, top_k=3, min_score=0.35) == [],
+            "样例作废后索引同步失效",
+        )
+
+        # ---- 归纳：多条样例里反复出现的词 → 候选标签 ----
+        for text in ("帮我把这句话念一遍", "再念一遍刚才那句", "念一遍我发的话"):
+            LEARNING.record(probe, text)
+        LEARNING.apply(REGISTRY)
+        plugin._rebuild_index()
+
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_learning_list()))
+        check(payload.get("enabled") is True, "learning/list 报告学习已启用")
+        entry = next(
+            (item for item in payload.get("tools", []) if item["name"] == probe),
+            None,
+        )
+        check(entry is not None and entry["count"] == 3, f"列出一条工具 3 条样例：{entry and entry['count']}")
+        check(
+            "一遍" in (entry or {}).get("suggested_tags", []),
+            f"归纳出候选标签：{(entry or {}).get('suggested_tags')}",
+        )
+
+        # ---- 采纳归纳标签：写成 manual 覆盖，模型总结也冲不掉 ----
+        # 注意顺序：归纳要求"至少 3 条样例"，所以必须在删样例之前做。
+        plugin_main.request = FakeWebRequest({"names": [probe]})
+        payload = body_of(asyncio.run(plugin.page_learning_induct()))
+        check(probe in (payload.get("adopted") or {}), f"采纳结果：{payload}")
+        meta = REGISTRY.get(probe)
+        check("一遍" in meta.tags, f"标签已写进注册表：{meta.tags}")
+        check(OVERRIDES.get(probe) is not None, "同时写了覆盖")
+        check(OVERRIDES.get(probe).source == "manual", "来源是 manual（人工动作）")
+        check(
+            (learn_dir / "tool_overrides.json").is_file(),
+            "归纳出的标签已落盘（重启后仍在）",
+        )
+        check(
+            bool(plugin.index.search("念一遍这个", top_k=3, min_score=0.35)),
+            "采纳的标签立刻参与检索",
+        )
+
+        # ---- 人工删除单条样例（自动负反馈几乎不可用时唯一的纠正手段）----
+        plugin_main.request = FakeWebRequest({"name": probe, "text": "再念一遍刚才那句"})
+        payload = body_of(asyncio.run(plugin.page_learning_forget()))
+        check(payload.get("count") == 2, f"learning/forget 删掉一条：剩 {payload.get('count')}")
+        check(
+            "再念一遍刚才那句" not in LEARNING.examples(probe),
+            "被删的样例确实不在存储里了",
+        )
+
+        plugin_main.request = FakeWebRequest({"name": probe, "text": "根本没这条"})
+        resp = asyncio.run(plugin.page_learning_forget())
+        check(resp.status_code == 400, "删不存在的样例返回 400 而不是静默成功")
+
+        # ---- 自动采纳开关：默认关，开了才动 ----
+        OVERRIDES.remove(probe)
+        OVERRIDES.apply_all(REGISTRY)  # meta.tags 回到基线（空）
+        LEARNING.clear(probe)
+        for text in ("帮我把这句话念一遍", "再念一遍刚才那句", "念一遍我发的话"):
+            LEARNING.record(probe, text)
+        check(
+            plugin._maybe_auto_induct(probe) == []
+            and REGISTRY.get(probe).tags == (),
+            "auto_induct_tags 默认关闭：即使算得出候选也不采纳",
+        )
+
+        plugin._apply_config(
+            {
+                "enabled": True,
+                "prefetch_enabled": True,
+                "min_score": 0.35,
+                "auto_induct_tags": True,
+            }
+        )
+        adopted_auto = plugin._maybe_auto_induct(probe)
+        check(
+            "一遍" in adopted_auto,
+            f"开启后达到门槛即自动采纳：{adopted_auto}",
+        )
+        check(
+            "一遍" in REGISTRY.get(probe).tags,
+            f"自动采纳也写进注册表：{REGISTRY.get(probe).tags}",
+        )
+        plugin._apply_config(
+            {"enabled": True, "prefetch_enabled": True, "min_score": 0.35}
+        )
+        OVERRIDES.remove(probe)
+        OVERRIDES.apply_all(REGISTRY)
+        plugin._rebuild_index()
+
+        # ---- 清空 ----
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_learning_clear()))
+        check(payload.get("total") == 0, f"learning/clear 清空：{payload}")
+        check(LEARNING.count() == 0, "内存里的样例也清空了")
+    finally:
+        plugin.context = real_ctx3
+        LEARNING.clear()
+        LEARNING.path = real_learn_path
+        LEARNING.max_examples = real_learn_max
+        OVERRIDES.path = real_learn_override_path
+        if OVERRIDES.get("learn_probe_tool") is not None:
+            OVERRIDES.remove("learn_probe_tool")
+        OVERRIDES.apply_all(REGISTRY)
+        REGISTRY.forget_source("smoke_learn")
+        plugin._rebuild_index()
+        shutil.rmtree(learn_dir, ignore_errors=True)
 
     total = _PASSED + len(_FAILED)
     print()

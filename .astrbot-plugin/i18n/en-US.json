@@ -18,6 +18,8 @@
       "threshold": "Threshold",
       "run": "Run",
       "tools": "Tool registry",
+      "tools_hint": "Tags drive lazy retrieval; edit and save them right here — changes go to the override layer, never to the source",
+      "enrich": "Fill in tags with an LLM",
       "col_name": "Tool",
       "col_source": "Source",
       "col_tags": "Tags",
@@ -44,6 +46,19 @@
       "install": "Install",
       "import": "Import from an installed plugin",
       "import_hint": "Copy a plugin's source from data/plugins into sub_plugins/; only plain-function tool sets written with @lazy_tool are accepted",
+      "learning": "Learning & induction",
+      "learning_clear": "Clear all learning",
+      "learning_hint": "Samples are the user's own wording from turns where the model actually called that tool; they outweigh hand-written examples in retrieval. Induction proposes words that recur across samples as tags",
+      "learning_off": "Inductive learning is off (learning_enabled=false).",
+      "learning_empty": "Nothing learned yet. Chat normally, let the model use a tool, then come back and refresh. Only tools registered by this plugin are learned.",
+      "learning_sample": "samples",
+      "learning_summary": "{total} samples · induction threshold {min_hits}",
+      "learning_suggest": "Induced tag candidates:",
+      "learning_adopt": "Adopt these tags",
+      "learning_clear_one": "Clear this tool's learning",
+      "learning_drop": "Drop this sample (delete it if it was learned wrong)",
+      "learning_suggested": "Has candidates",
+      "learning_overridden": "Overridden",
       "commands": "Command panel"
     }
   }

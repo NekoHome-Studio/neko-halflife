@@ -101,6 +101,30 @@
     "default": 60,
     "hint": "导入是同步等待的，超时就跳过总结、照常完成导入，不会卡住"
   },
+  "learning_enabled": {
+    "description": "启用归纳学习",
+    "type": "bool",
+    "default": true,
+    "hint": "观察「模型真的调用了哪个工具」，把那一轮用户的原话记成该工具的学习样例并进入检索索引——用实证替代猜测。学习样例在检索里的权重高于作者手写的 examples。数据落在插件数据目录，面板里可逐条删除（学错了就删）或清空重学"
+  },
+  "learning_max_examples": {
+    "description": "每个工具最多保留多少条学习样例",
+    "type": "int",
+    "default": 20,
+    "hint": "超出后按命中次数淘汰，让高频说法沉淀下来"
+  },
+  "induction_min_hits": {
+    "description": "归纳为候选标签所需的最少样例数",
+    "type": "int",
+    "default": 3,
+    "hint": "一个词要出现在多少条**不同**的学习样例里才提议为标签。调低更激进（容易把噪声词提上来），调高更保守"
+  },
+  "auto_induct_tags": {
+    "description": "自动采纳归纳出的标签",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭：候选标签只在面板上展示，由你确认后再采纳。开启后会自动写进标签（仍可在面板上重置）"
+  },
   "debug": {
     "description": "输出每轮注入明细日志",
     "type": "bool",

@@ -430,7 +430,7 @@ def test_install_roundtrip() -> None:
     scratch = PLUGIN_ROOT / ".selftest-scratch"
     if scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)
-    scratch.mkdir(parents=True)
+    scratch.mkdir(parents=True, exist_ok=True)
 
     try:
         _install_roundtrip_body(scratch)
@@ -497,7 +497,7 @@ def test_plugin_import_analysis() -> None:
     scratch = PLUGIN_ROOT / ".selftest-scratch"
     if scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)
-    scratch.mkdir(parents=True)
+    scratch.mkdir(parents=True, exist_ok=True)
     try:
         _plugin_import_body(scratch)
     finally:
@@ -628,7 +628,7 @@ def test_overrides_store() -> None:
     scratch = PLUGIN_ROOT / ".selftest-scratch" / "overrides"
     if scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True)
-    scratch.mkdir(parents=True)
+    scratch.mkdir(parents=True, exist_ok=True)
 
     store = OverrideStore(scratch / "ov.json")
     meta = ToolMeta(
@@ -743,6 +743,205 @@ def test_enrich_parsing() -> None:
     check(len(all_briefs) == 2, "only_missing=False 时全都送")
 
 
+def test_identifier_splitting() -> None:
+    print("retriever / 标识符拆分（修掉 weather 匹配不到 get_weather 的漏洞）")
+    from core.retriever import split_identifier
+
+    check(
+        split_identifier("get_weather") == ["get", "weather"],
+        f"snake_case 拆分：{split_identifier('get_weather')}",
+    )
+    check(
+        set(split_identifier("GetWeather")) == {"get", "weather"},
+        f"PascalCase 拆分：{split_identifier('GetWeather')}",
+    )
+    check(
+        set(split_identifier("get-weather.v2")) == {"get", "weather", "v2"},
+        f"连字符与点号也拆：{split_identifier('get-weather.v2')}",
+    )
+
+    tokens = tokenize("get_weather")
+    check("get_weather" in tokens, "整词仍然保留（改动是超集，不丢原有能力）")
+    check("weather" in tokens and "get" in tokens, "子词也进了查询 token")
+
+    index = ToolIndex()
+    index.build(
+        [
+            ToolMeta(
+                name="get_weather",
+                description="query the weather",
+                module="m",
+                tags=(),
+            )
+        ]
+    )
+    hits = index.search("weather", top_k=3, min_score=0.3)
+    check(
+        bool(hits) and hits[0][0].name == "get_weather",
+        "用户说 weather 就能召回 get_weather（这正是本次修复）",
+    )
+
+
+def test_fuzzy_and_single_char() -> None:
+    print("retriever / 错拼容忍与单字兜底")
+    index = ToolIndex()
+    index.build(
+        [
+            ToolMeta(
+                name="weather_tool",
+                description="check the weather forecast",
+                module="m",
+                tags=("weather",),
+            ),
+            ToolMeta(
+                name="cold_tool",
+                description="查询天气冷的时候要穿什么",
+                module="m",
+                tags=(),
+            ),
+        ]
+    )
+    hits = index.search("wether", top_k=3, min_score=0.2)
+    check(
+        bool(hits) and hits[0][0].name == "weather_tool",
+        f"拼错一个字母也能召回：{[(m.name, round(s, 3)) for m, s in hits]}",
+    )
+    exact = index.search("weather", top_k=1, min_score=0.0)
+    check(
+        bool(exact) and hits[0][1] < exact[0][1],
+        f"但拼错的分数低于拼对：{round(hits[0][1], 3)} < {round(exact[0][1], 3)}",
+    )
+    check(
+        index.search("wether", top_k=3, min_score=0.9) == [],
+        "拼错的分数被 0.6 折扣压到高阈值之下（阈值对它是有效的）",
+    )
+    check(
+        index.informative_tokens("wether") != [],
+        "诊断口径与检索一致（错拼也算信息词）",
+    )
+
+    hits = index.search("冷", top_k=3, min_score=0.2)
+    check(
+        bool(hits) and hits[0][0].name == "cold_tool",
+        f"单字查询靠单字索引兜底命中：{[(m.name, round(s, 3)) for m, s in hits]}",
+    )
+
+
+def test_learning_store() -> None:
+    print("learning / 学习样例的存取与自我修正")
+    import shutil
+
+    from core.learning import LearningStore, normalize_query
+
+    check(normalize_query("  a  ") == "", "过短的句子不学")
+    check(normalize_query("x" * 200) == "", "过长的句子不学")
+    check(normalize_query(" 帮我  查天气 ") == "帮我 查天气", "空白被规整")
+
+    scratch = PLUGIN_ROOT / ".selftest-scratch" / "learning"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    store = LearningStore(scratch / "learned.json", max_examples=3)
+    check(store.record("t1", "帮我查天气") is True, "记录一条样例")
+    check(store.record("t1", "帮我查天气") is True, "重复记录命中原样例")
+    check(store.examples("t1") == ["帮我查天气"], "重复不产生新样例")
+    check(store.count() == 1, "计数正确")
+
+    for i in range(5):
+        store.record("t1", f"第{i}种说法")
+    check(len(store.examples("t1")) <= 3, f"样例数受上限约束：{store.examples('t1')}")
+    check("帮我查天气" in store.examples("t1"), "命中最多的样例优先保留")
+
+    # 负反馈：这条样例命中过 2 次（上面记了两遍），要失败 2 次才作废
+    check(store.record_failure("t1", "帮我查天气") is True, "记一次负反馈")
+    check("帮我查天气" in store.examples("t1"), "失败次数还不够，样例先保留")
+    check(store.record_failure("t1", "帮我查天气") is True, "再记一次负反馈")
+    check(
+        "帮我查天气" not in store.examples("t1"),
+        "失败次数达到命中次数后样例被作废",
+    )
+
+    store.record("t2", "另一种说法")
+    check(store.save() is True, "落盘成功")
+    reloaded = LearningStore(scratch / "learned.json")
+    check(reloaded.load() >= 1, "重新加载读回样例")
+    check(reloaded.examples("t2") == ["另一种说法"], "落盘内容正确")
+
+    check(store.clear("t2") == 1, "清除指定工具")
+    check(store.clear() >= 0, "清除全部")
+    check(store.count() == 0, "清空后计数为 0")
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_induction_suggests_tags() -> None:
+    print("learning / 归纳：反复出现的词升格为候选标签")
+    from core.learning import LearningStore
+
+    store = LearningStore(None, max_examples=50)
+    for text in ("帮我报销一下差旅费", "这个月报销还没提交", "报销单怎么填"):
+        store.record("reimburse_tool", text)
+    store.record("reimburse_tool", "把发票给我")
+
+    suggestions = store.suggest_tags("reimburse_tool", [], min_hits=3)
+    check("报销" in suggestions, f"高频词被提议为标签：{suggestions}")
+    check("把发票给我" not in suggestions, "整句不会被当成标签")
+    check(
+        "报销" not in store.suggest_tags("reimburse_tool", ["报销"], min_hits=3),
+        "已经是标签的就不再重复提议",
+    )
+    check(
+        all(len(tag) >= 2 for tag in suggestions),
+        "不提议单字（噪声太大）",
+    )
+    check(
+        store.suggest_tags("reimburse_tool", [], min_hits=99) == [],
+        "门槛调高就没有提议",
+    )
+
+    store.record("repeat_tool", "报销 报销 报销")
+    store.record("repeat_tool", "随便说点别的吧")
+    store.record("repeat_tool", "再随便说点啥")
+    check(
+        store.suggest_tags("repeat_tool", [], min_hits=3) == [],
+        "同一个词在一句话里重复三遍不算三次证据（按不同样例计数）",
+    )
+
+
+def test_learning_improves_recall() -> None:
+    print("learning / 归纳学习真的提升召回（本功能的因果证明）")
+    from core.learning import LearningStore
+
+    meta = ToolMeta(
+        name="ticket_tool",
+        description="submit something",
+        module="m",
+        source="main",
+        tags=(),
+    )
+    index = ToolIndex()
+    index.build([meta])
+    question = "帮我把这个工单提一下"
+    check(
+        index.search(question, top_k=3, min_score=0.3) == [],
+        "学之前，这句口语召回不到（描述里没有配套的词）",
+    )
+
+    store = LearningStore(None, max_examples=20)
+    store.record("ticket_tool", question)
+    store.apply(build_registry(meta))
+    index.build([meta])
+    hits = index.search(question, top_k=3, min_score=0.3)
+    check(
+        bool(hits) and hits[0][0].name == "ticket_tool",
+        "学之后，同一句话就能召回 —— 这就是归纳学习的价值",
+    )
+    check(
+        bool(meta.learned),
+        f"学习样例已写进 meta 供检索使用：{meta.learned}",
+    )
+
+
 def main() -> int:
     for test in (
         test_tokenize,
@@ -766,6 +965,11 @@ def main() -> int:
         test_overrides_store,
         test_tags_drive_retrieval,
         test_enrich_parsing,
+        test_identifier_splitting,
+        test_fuzzy_and_single_char,
+        test_learning_store,
+        test_induction_suggests_tags,
+        test_learning_improves_recall,
     ):
         test()
         print()

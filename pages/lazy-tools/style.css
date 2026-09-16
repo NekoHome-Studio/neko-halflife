@@ -633,3 +633,56 @@ input:focus {
 #tools-body .cmd-input {
   min-width: 180px;
 }
+
+/* ---- 归纳学习 ---- */
+
+.learn-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0;
+}
+
+.learn-example {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  padding: 1px 0 1px 10px;
+  border-left: 2px solid var(--border);
+}
+
+.learn-text {
+  flex: 1;
+  word-break: break-all;
+}
+
+/* 学错了要能删掉：自动负反馈在 AstrBot 上基本不触发，人工纠正是兜底 */
+.learn-drop {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.learn-drop:hover {
+  color: #fff;
+  background: var(--danger, #c0392b);
+}
+
+.learn-suggest {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.learn-suggest .btn {
+  margin-left: 4px;
+}

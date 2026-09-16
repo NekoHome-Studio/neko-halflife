@@ -18,6 +18,8 @@
       "threshold": "阈值",
       "run": "试跑",
       "tools": "工具清单",
+      "tools_hint": "标签是懒加载的召回依据，可直接编辑后保存；改动只写入覆盖层，不动源码",
+      "enrich": "用 LLM 补全标签",
       "col_name": "工具名",
       "col_source": "来源",
       "col_tags": "标签",
@@ -44,6 +46,19 @@
       "install": "安装",
       "import": "从已装插件导入",
       "import_hint": "把 data/plugins 下插件的源码复制进 sub_plugins/；只接受用 @lazy_tool 写的普通函数工具集",
+      "learning": "学习与归纳",
+      "learning_clear": "清空全部学习",
+      "learning_hint": "样例来自「模型真的调用了该工具」的那一轮用户原话，检索权重高于作者手写的 examples；归纳会把多条样例里反复出现的词提议成标签",
+      "learning_off": "归纳学习已关闭（learning_enabled=false）。",
+      "learning_empty": "还没有学到任何样例。正常聊天、让模型用上工具之后回来刷新即可。只有本插件注册的工具会被学习。",
+      "learning_sample": "条样例",
+      "learning_summary": "共 {total} 条样例 · 归纳门槛 {min_hits} 条",
+      "learning_suggest": "归纳出的候选标签：",
+      "learning_adopt": "采纳这些标签",
+      "learning_clear_one": "清除该工具的学习",
+      "learning_drop": "删掉这条样例（学错了就删）",
+      "learning_suggested": "有候选标签",
+      "learning_overridden": "已有覆盖",
       "commands": "指令面板"
     }
   }

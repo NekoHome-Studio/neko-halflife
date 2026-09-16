@@ -30,13 +30,30 @@ logger = logging.getLogger("astrbot_plugin_neko_halflife")
 FIELD_WEIGHTS: dict[str, float] = {
     "name": 3.0,
     "tags": 2.5,
+    # 学习样例权重仅次于标签：它们是"用户真的这么说、而且模型真的选了这个工具"
+    # 的实证记录，比作者凭空写的 examples 更可信。
+    "learned": 2.2,
     "group": 2.0,
     "examples": 1.5,
     "description": 1.0,
 }
 
+#: 单字 CJK 在索引里的权重折扣。单字很常见、噪声大，给个低权重做兜底：
+#: 让「冷」这种一字查询有机会命中「天气冷」里的 bigram 索引之外的场景。
+_CJK_CHAR_DISCOUNT = 0.4
+
 _ASCII_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+#.-]*|\d+")
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+
+#: 标识符拆分：snake_case / kebab-case / dot.case 的分隔符。
+_IDENT_SPLIT_RE = re.compile(r"[_\-.+#]+")
+#: camelCase / PascalCase 的边界。
+_CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+#: 错拼容忍：只对够长的 ASCII token 做编辑距离 ≤1 的近似匹配。
+_TYPO_MIN_LEN = 5
+#: 词表规模上限——超过就不做近似匹配，避免检索变慢。
+_TYPO_VOCAB_CAP = 4000
 
 #: 出现频率过高的词（几乎每轮对话都会出现）不参与打分，避免把工具全激活。
 #: 中文部分特意收录了一批口语填充 bigram：它们在中文里几乎不携带信息，
@@ -63,16 +80,47 @@ _COVERAGE_WEIGHT = 0.65
 _STRENGTH_WEIGHT = 0.35
 
 
+def split_identifier(token: str) -> list[str]:
+    """把 ``get_weather`` / ``GetWeather`` / ``get-weather`` 拆成子词。
+
+    **这是修一个真实的召回漏洞**：原来 ``get_weather`` 会被当成**一个** token，
+    所以用户说 "weather" 永远匹配不上名为 ``get_weather`` 的工具。
+    """
+    parts: list[str] = []
+    for chunk in _IDENT_SPLIT_RE.split(token):
+        if not chunk:
+            continue
+        for piece in _CAMEL_SPLIT_RE.findall(chunk):
+            piece = piece.lower()
+            if piece and piece not in parts:
+                parts.append(piece)
+    return parts
+
+
 def tokenize(text: str) -> Counter[str]:
-    """把文本切成检索 token 并计数。中英文混排安全。"""
+    """把文本切成检索 token 并计数。中英文混排安全。
+
+    与早期版本相比多了两件事：
+
+    * **标识符拆分**：ASCII token 除了整体，还会被拆成子词（见
+      :func:`split_identifier`），修掉 "weather" 匹配不到 "get_weather" 的漏洞；
+    * **单字 CJK 兜底**：中文汉字串除 bigram 外，还单独收录每个字（低权重），
+      让一字查询或生僻词也有机会命中。
+    """
     tokens: Counter[str] = Counter()
     if not text:
         return tokens
     low = text.lower()
     for match in _ASCII_RE.finditer(low):
         token = match.group(0).strip(".-")
-        if token and token not in _STOPWORDS:
+        if not token:
+            continue
+        if token not in _STOPWORDS:
             tokens[token] += 1
+        # 拆分出的子词单独计数；整词保留，所以这是"超集"改动，不会丢原有能力
+        for part in split_identifier(token):
+            if part != token and part not in _STOPWORDS:
+                tokens[part] += 1
     for match in _CJK_RE.finditer(low):
         run = match.group(0)
         if len(run) == 1:
@@ -86,6 +134,32 @@ def tokenize(text: str) -> Counter[str]:
         if len(run) <= 4 and run not in _STOPWORDS:
             tokens[run] += 1
     return tokens
+
+
+def _edit_distance_within_one(a: str, b: str) -> bool:
+    """两个字符串的编辑距离是否 ≤1。比通用 DP 快得多，且够用。"""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:
+        diff = sum(1 for x, y in zip(a, b, strict=False) if x != y)
+        return diff <= 1
+    # 长度差 1：短串是否可由长串删一个字符得到
+    short, long = (a, b) if la < lb else (b, a)
+    i = j = 0
+    skipped = False
+    while i < len(short) and j < len(long):
+        if short[i] != long[j]:
+            if skipped:
+                return False
+            skipped = True
+            j += 1
+            continue
+        i += 1
+        j += 1
+    return True
 
 
 class ToolIndex:
@@ -114,9 +188,43 @@ class ToolIndex:
                 for token, count in tokenize(text).items():
                     # 同一字段内重复出现只按一次计，避免长描述靠复读刷分。
                     weights[token] = weights.get(token, 0.0) + weight * min(count, 1)
+                # 单字 CJK 兜底：bigram 之外再收录每个汉字（低权重），
+                # 让「冷」这类一字查询有机会命中。
+                for run in _CJK_RE.findall(text):
+                    for char in run:
+                        if char in _STOPWORDS:
+                            continue
+                        weights[char] = (
+                            weights.get(char, 0.0) + weight * _CJK_CHAR_DISCOUNT
+                        )
             for token, weight in weights.items():
                 self._postings.setdefault(token, {})[meta.name] = weight
                 self._doc_freq[token] = self._doc_freq.get(token, 0) + 1
+
+    def _postings_for(self, token: str) -> list[tuple[str, dict[str, float], float]]:
+        """取一个查询 token 的倒排项，必要时做错拼近似。
+
+        Returns:
+            ``[(实际匹配到的词, 倒排项, 置信折扣)]``。精确命中时折扣为 1.0。
+        """
+        posting = self._postings.get(token)
+        if posting:
+            return [(token, posting, 1.0)]
+        # 错拼容忍：只对够长的纯字母 ASCII token 做编辑距离 ≤1 的近似匹配
+        if not (
+            len(token) >= _TYPO_MIN_LEN
+            and token.isascii()
+            and token.isalpha()
+            and len(self._postings) <= _TYPO_VOCAB_CAP
+        ):
+            return []
+        hits: list[tuple[str, dict[str, float], float]] = []
+        for candidate, candidate_posting in self._postings.items():
+            if not candidate.isascii() or abs(len(candidate) - len(token)) > 1:
+                continue
+            if _edit_distance_within_one(token, candidate):
+                hits.append((candidate, candidate_posting, 0.6))
+        return hits
 
     def search(
         self,
@@ -141,21 +249,30 @@ class ToolIndex:
         # 先收集「查询里真正有信息量的词」：只有出现在倒排表里的 token 才参与分母。
         # 中文长句会被切成大量无意义的 bigram，如果把它们算进分母，
         # 真正命中的那个词会被稀释到阈值以下——这正是早期版本误漏工具的原因。
+        # 错拼近似命中的词也算信息词，但按 0.6 折算 idf，体现"不确定但有用"。
         informative: dict[str, float] = {}
         buckets: dict[str, dict[str, float]] = {}
+        # 每个工具最终采用的是"最可信的那次匹配"的置信度。全部靠错拼命中时
+        # 这个值会小于 1，用来在总分上真正体现出"这是猜的"。
+        confidence_of: dict[str, float] = {}
         for token, q_count in q_tokens.items():
-            posting = self._postings.get(token)
-            if not posting:
-                continue
-            # idf：只在少数工具里出现的词更有区分度。
-            df = max(self._doc_freq.get(token, 1), 1)
-            idf = math.log(1.0 + len(self._tools) / df) + 1.0
-            informative[token] = idf
-            for tool_name, weight in posting.items():
-                if tool_name in excluded:
-                    continue
-                bucket = buckets.setdefault(tool_name, {})
-                bucket[token] = weight * idf * (1.0 + 0.25 * (q_count - 1))
+            for matched_token, posting, confidence in self._postings_for(token):
+                # idf：只在少数工具里出现的词更有区分度。
+                df = max(self._doc_freq.get(matched_token, 1), 1)
+                idf = (math.log(1.0 + len(self._tools) / df) + 1.0) * confidence
+                # 同一个查询词只记一次分母（近似命中可能有多个候选词）
+                informative[token] = max(informative.get(token, 0.0), idf)
+                for tool_name, weight in posting.items():
+                    if tool_name in excluded:
+                        continue
+                    bucket = buckets.setdefault(tool_name, {})
+                    contribution = weight * idf * (1.0 + 0.25 * (q_count - 1))
+                    # 同一个工具可能被多个近似词命中，取最大而不是累加，
+                    # 免得靠"撞上多个拼写相近的词"把分数堆上去。
+                    bucket[token] = max(bucket.get(token, 0.0), contribution)
+                    confidence_of[tool_name] = max(
+                        confidence_of.get(tool_name, 0.0), confidence
+                    )
 
         if not buckets:
             return []
@@ -173,6 +290,9 @@ class ToolIndex:
             # 强度：命中字段的平均权重相对于「全部命中工具名」的比值，饱和到 1。
             strength = min(1.0, sum(bucket.values()) / (name_weight * matched))
             score = _COVERAGE_WEIGHT * coverage + _STRENGTH_WEIGHT * strength
+            # 错拼折扣：只靠拼写近似匹配上的工具，分数必须实打实地低于精确命中，
+            # 否则 min_score 对它形同虚设（折扣在 coverage 的分子分母上会约掉）。
+            score *= confidence_of.get(tool_name, 1.0)
             if score >= min_score:
                 scored.append((meta, score))
 
@@ -180,12 +300,17 @@ class ToolIndex:
         return scored[: max(top_k, 0)]
 
     def informative_tokens(self, query: str) -> list[str]:
-        """返回查询里真正出现在倒排表中的 token。
+        """返回查询里**能匹配到东西**的 token。
 
         这是排查「为什么没命中」的第一现场：列表为空就说明这句话里的词
         与任何工具的名字/标签/描述/示例都没有交集，此时不该怀疑阈值。
+        这里算上错拼近似，所以和 :meth:`search` 的口径一致——否则会出现
+        "工具明明命中了，诊断却说没有信息词"的矛盾。
         """
-        return sorted(token for token in tokenize(query) if token in self._postings)
+        found = {
+            token for token in tokenize(query) if self._postings_for(token)
+        }
+        return sorted(found)
 
     def describe_scores(self, query: str, tools: Sequence[str]) -> dict[str, float]:
         """调试用：给出指定工具名与查询的匹配分。"""
