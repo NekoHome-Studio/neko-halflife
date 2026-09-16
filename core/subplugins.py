@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import importlib.util
+import builtins
 import logging
 import sys
 from pathlib import Path
@@ -36,6 +37,35 @@ logger = logging.getLogger("astrbot_plugin_neko_halflife")
 
 #: 子插件目录名，相对插件根目录。
 SUBDIR_NAME = "sub_plugins"
+
+#: 临时注入 builtins 的名字，见 :func:`_install_builtin_lazy_tool`。
+_BUILTIN_INJECT_NAME = "lazy_tool"
+
+
+def _install_builtin_lazy_tool() -> bool:
+    """把 ``lazy_tool`` 临时放进 ``builtins``，返回是否真的装了。
+
+    **为什么需要它**：加载器只把 ``lazy_tool`` 注入**入口模块**的命名空间。
+    子插件包里的其它子模块（例如 ``__init__.py`` 里 ``from . import tools``）
+    用裸名 ``@lazy_tool`` 会直接 ``NameError``——手写的包子插件也一样会踩到。
+
+    装饰器只在**导入期**执行，而所有子模块的导入都发生在 ``exec_module`` 这一个
+    窗口内，所以临时放进 builtins 就能覆盖全部子模块；窗口一结束立刻移除，
+    不会长期污染全局命名空间。若已有同名 builtins，则放弃注入（不覆盖别人的东西）。
+    """
+    if hasattr(builtins, _BUILTIN_INJECT_NAME):
+        return False
+    setattr(builtins, _BUILTIN_INJECT_NAME, lazy_tool)
+    return True
+
+
+def _remove_builtin_lazy_tool(installed: bool) -> None:
+    if not installed:
+        return
+    try:
+        delattr(builtins, _BUILTIN_INJECT_NAME)
+    except AttributeError:  # pragma: no cover - 被别处删掉了
+        pass
 
 
 def _package_prefix() -> str:
@@ -111,9 +141,11 @@ class SubPluginLoader:
             # 先放进 sys.modules：模块内相对导入与 dataclass/pickle 都依赖它。
             sys.modules[module_name] = module
             token = push_source(name)
+            installed_builtin = _install_builtin_lazy_tool()
             try:
                 spec.loader.exec_module(module)
             finally:
+                _remove_builtin_lazy_tool(installed_builtin)
                 pop_source(token)
         except Exception as exc:  # noqa: BLE001 - 子插件出错不能拖垮主插件
             self.errors[name] = f"{type(exc).__name__}: {exc}"

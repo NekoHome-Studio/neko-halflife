@@ -299,12 +299,16 @@ def test_high_risk_flag() -> None:
 
 
 def _expect_upload_error(fn, label: str) -> None:
+    _expect_raises(fn, f"{label} → 已拒绝", UploadError)
+
+
+def _expect_raises(fn, label: str, exc_type: type[BaseException]) -> None:
     try:
         fn()
-    except UploadError as exc:
-        check(True, f"{label} → 已拒绝（{str(exc)[:36]}…）")
+    except exc_type as exc:
+        check(True, f"{label}（{str(exc)[:36]}…）")
     except Exception as exc:  # noqa: BLE001
-        check(False, f"{label} → 抛出了非 UploadError：{type(exc).__name__}: {exc}")
+        check(False, f"{label} → 抛出了 {type(exc).__name__}，期望 {exc_type.__name__}")
     else:
         check(False, f"{label} → 竟然通过了")
 
@@ -486,6 +490,112 @@ def _install_roundtrip_body(raw: Path) -> None:
     )
 
 
+def test_plugin_import_analysis() -> None:
+    print("plugin_import / 已装插件的可移植性分析")
+    import shutil
+
+    scratch = PLUGIN_ROOT / ".selftest-scratch"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+    try:
+        _plugin_import_body(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _plugin_import_body(raw: Path) -> None:
+    from core import plugin_import
+
+    def make(name: str, source: str, metadata: str = "name: x\n") -> Path:
+        path = raw / "plugins" / name
+        path.mkdir(parents=True)
+        (path / "main.py").write_text(source, encoding="utf-8")
+        (path / "metadata.yaml").write_text(metadata, encoding="utf-8")
+        return path
+
+    # 1) 可导入：模块级普通函数 + @lazy_tool
+    good = make(
+        "good_tools",
+        "from astrbot.api.event import AstrMessageEvent\n\n"
+        "@lazy_tool(name='good_tool', tags=('t',))\n"
+        "async def good_tool(event: AstrMessageEvent, x: str) -> str:\n"
+        "    return x\n",
+    )
+    analysis = plugin_import.analyze_plugin_dir(good)
+    check(analysis.portable, f"普通函数工具集判定为可导入（reason={analysis.reasons}）")
+    check(analysis.lazy_tool_names == ["good_tool"], f"识别工具名：{analysis.lazy_tool_names}")
+    check(analysis.tool_modules == ["main"], f"识别工具模块：{analysis.tool_modules}")
+
+    # 2) 拒绝：用了 AstrBot 自带的工具装饰器（导入即有全局副作用）
+    bad = make(
+        "bad_tools",
+        "from astrbot.api.event import filter\n\n"
+        "@filter.llm_tool(name='bad')\n"
+        "async def bad(self, event):\n"
+        "    return 'x'\n",
+    )
+    analysis = plugin_import.analyze_plugin_dir(bad)
+    check(not analysis.portable, "用 @filter.llm_tool 的插件被拒绝")
+    check(
+        any("AstrBot" in reason for reason in analysis.reasons),
+        "拒绝原因点名了 AstrBot 装饰器",
+    )
+
+    # 3) 拒绝：没有任何 @lazy_tool（导入后不会注册任何工具）
+    plain = make("plain", "x = 1\n")
+    analysis = plugin_import.analyze_plugin_dir(plain)
+    check(
+        not analysis.portable
+        and any("@lazy_tool" in reason for reason in analysis.reasons),
+        "没有 @lazy_tool 的插件被拒绝",
+    )
+
+    # 4) Star 子类只警告、不阻断
+    mixed = make(
+        "mixed",
+        "from astrbot.api.star import Star\n\n\n"
+        "class P(Star):\n    pass\n\n\n"
+        "@lazy_tool()\n"
+        "async def tool_a(event, x: str) -> str:\n    return x\n",
+    )
+    analysis = plugin_import.analyze_plugin_dir(mixed)
+    check(
+        analysis.portable and analysis.has_star_class and bool(analysis.warnings),
+        "有 Star 子类时只警告不阻断",
+    )
+    check("tool_a" in analysis.lazy_tool_names, "没写 name= 时用函数名兜底")
+
+    # 5) 生成的包入口
+    entry = plugin_import.build_entry_source(["main", "pkg.tools"])
+    check("from . import main" in entry, "根模块生成 from . import main")
+    check("from .pkg import tools" in entry, "子包模块生成 from .pkg import tools")
+
+    # 6) 复制：不搬 metadata.yaml，且默认拒绝覆盖
+    dest = raw / "sub_plugins" / "good_tools"
+    copied = plugin_import.copy_plugin_tree(good, dest)
+    check(copied >= 1 and (dest / "main.py").is_file(), f"复制了 {copied} 个文件")
+    check(
+        not (dest / "metadata.yaml").exists(),
+        "不复制 metadata.yaml（子插件不是 AstrBot 插件）",
+    )
+    _expect_raises(
+        lambda: plugin_import.copy_plugin_tree(good, dest),
+        "目标已存在且未允许覆盖",
+        FileExistsError,
+    )
+    check(
+        plugin_import.copy_plugin_tree(good, dest, overwrite=True) >= 1,
+        "允许覆盖时复制成功",
+    )
+    entry_path = plugin_import.write_entry(dest, ["main"])
+    check(
+        entry_path.is_file()
+        and "from . import main" in entry_path.read_text(encoding="utf-8"),
+        "写入包入口 __init__.py",
+    )
+
+
 def main() -> int:
     for test in (
         test_tokenize,
@@ -505,6 +615,7 @@ def main() -> int:
         test_package_root_detection,
         test_zip_plan_rejects,
         test_install_roundtrip,
+        test_plugin_import_analysis,
     ):
         test()
         print()

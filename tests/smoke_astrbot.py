@@ -109,6 +109,7 @@ def main() -> int:
     REGISTRY = importlib.import_module(f"{PKG_ALIAS}.core.registry").REGISTRY
     ToolIndex = importlib.import_module(f"{PKG_ALIAS}.core.retriever").ToolIndex
     SubPluginLoader = importlib.import_module(f"{PKG_ALIAS}.core.subplugins").SubPluginLoader
+    plugin_import = importlib.import_module(f"{PKG_ALIAS}.core.plugin_import")
 
     print("1. 主插件工具注册")
     names = {tool.name for tool in llm_tools.func_list}
@@ -786,6 +787,147 @@ def main() -> int:
     finally:
         plugin.loader.root = real_loader_root
         plugin_main.command_management = real_cmd_mgmt
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    print()
+    print("15. 从已装插件导入为子插件")
+
+    scratch = PLUGIN_ROOT / ".selftest-scratch"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+    plugins_root = scratch / "plugins"
+    plugins_root.mkdir()
+    sub_root = scratch / "sub_plugins"
+    sub_root.mkdir()
+
+    real_loader_root = plugin.loader.root
+    real_plugins_root = plugin_main.LazyToolsPlugin._plugins_root
+    real_analyze = plugin_import.analyze_plugin_dir
+
+    def write_plugin(name: str, source: str) -> None:
+        path = plugins_root / name
+        path.mkdir(parents=True)
+        (path / "main.py").write_text(source, encoding="utf-8")
+        (path / "metadata.yaml").write_text(
+            f"name: {name}\ndisplay_name: {name}\nversion: 1.0.0\n", encoding="utf-8"
+        )
+
+    write_plugin(
+        "good_tools",
+        "@lazy_tool(name='imported_tool', tags=('imported',))\n"
+        "async def imported_tool(event, text: str) -> str:\n"
+        '    """导入的工具。\n\n    Args:\n        text(string): 内容\n    """\n'
+        "    return text\n",
+    )
+    write_plugin(
+        "bad_tools",
+        "from astrbot.api.event import filter\n\n"
+        "@filter.llm_tool(name='bad_tool')\n"
+        "async def bad_tool(self, event):\n"
+        "    return 'x'\n",
+    )
+    # 静态扫描看不出来、只在导入期才注册脏工具的插件（用于测运行期兜底）
+    write_plugin(
+        "sneaky",
+        "from astrbot.core.provider.register import llm_tools\n\n\n"
+        "async def stray_handler(event):\n"
+        '    """stray"""\n'
+        '    return "x"\n\n\n'
+        'llm_tools.add_func("stray_tool_xyz", [], "stray", stray_handler)\n',
+    )
+
+    plugin.loader.root = sub_root
+    plugin_main.LazyToolsPlugin._plugins_root = staticmethod(lambda: plugins_root)
+    try:
+        registered3: list[tuple[str, list[str]]] = []
+
+        class FakeContext3:
+            def register_web_api(self, route, handler, methods, description):
+                registered3.append((route, list(methods)))
+
+            def get_llm_tool_manager(self):
+                return llm_tools
+
+        plugin.context = FakeContext3()
+        plugin._register_web_apis()
+        routes3 = dict(registered3)
+        for suffix, method in (
+            ("plugin-import/candidates", "GET"),
+            ("plugin-import/apply", "POST"),
+        ):
+            route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+            check(routes3.get(route) == [method], f"注册了路由 {route} [{method}]")
+
+        # ---- 候选列表 ----
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_import_candidates()))
+        check(payload.get("supported") is True, "候选列表可用")
+        by_dir = {item["dir_name"]: item for item in payload["candidates"]}
+        check("good_tools" in by_dir and by_dir["good_tools"]["portable"], "普通函数工具集可导入")
+        check(
+            not by_dir["bad_tools"]["portable"]
+            and any("AstrBot" in r for r in by_dir["bad_tools"]["reasons"]),
+            "用 @filter.llm_tool 的插件在候选列表里就标为不可导入",
+        )
+
+        # ---- 导入成功 ----
+        plugin_main.request = FakeWebRequest({"dir_name": "good_tools"})
+        resp = asyncio.run(plugin.page_import_apply())
+        payload = body_of(resp)
+        check(
+            resp.status_code == 200 and payload.get("name") == "good_tools",
+            f"导入成功：{payload}",
+        )
+        check(
+            "imported_tool" in {t.name for t in llm_tools.func_list},
+            "导入的工具进了 AstrBot 全局 llm_tools",
+        )
+        check(REGISTRY.get("imported_tool") is not None, "导入的工具进了本插件注册表")
+        check((sub_root / "good_tools" / "__init__.py").is_file(), "生成了包入口")
+        check(
+            not (sub_root / "good_tools" / "metadata.yaml").exists(),
+            "没有搬运 metadata.yaml",
+        )
+
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_import_candidates()))
+        by_dir = {item["dir_name"]: item for item in payload["candidates"]}
+        check(by_dir["good_tools"]["already_imported"], "再次列出时标记为已导入")
+
+        # ---- 导入被拒（静态预检） ----
+        plugin_main.request = FakeWebRequest({"dir_name": "bad_tools"})
+        resp = asyncio.run(plugin.page_import_apply())
+        check(resp.status_code == 400, "静态预检不过的插件被拒绝")
+        check(not (sub_root / "bad_tools").exists(), "被拒时没有留下任何目录")
+
+        # ---- 目录穿越 ----
+        plugin_main.request = FakeWebRequest({"dir_name": "../evil"})
+        resp = asyncio.run(plugin.page_import_apply())
+        check(resp.status_code == 400, "目录穿越被拒")
+
+        # ---- 运行期兜底：静态扫描漏掉的脏注册必须被拦下并回滚 ----
+        stray_before = "stray_tool_xyz" in {t.name for t in llm_tools.func_list}
+        check(not stray_before, "前置条件：脏工具此刻不在全局表里")
+        plugin_import.analyze_plugin_dir = lambda path: plugin_import.ImportAnalysis(
+            dir_name=path.name, portable=True, tool_modules=["main"]
+        )
+        plugin_main.request = FakeWebRequest({"dir_name": "sneaky"})
+        resp = asyncio.run(plugin.page_import_apply())
+        check(resp.status_code == 400, "运行期检测到脏注册，导入被拒")
+        check(
+            "非本插件的工具被注册" in body_of(resp).get("message", ""),
+            f"错误信息点明脏注册：{body_of(resp).get('message', '')[:40]}…",
+        )
+        check(
+            "stray_tool_xyz" not in {t.name for t in llm_tools.func_list},
+            "脏注册的工具已被从全局表清理（否则会被当成别人的工具照常注入）",
+        )
+        check(not (sub_root / "sneaky").exists(), "失败后目录已回滚删除")
+    finally:
+        plugin.loader.root = real_loader_root
+        plugin_main.LazyToolsPlugin._plugins_root = real_plugins_root
+        plugin_import.analyze_plugin_dir = real_analyze
         shutil.rmtree(scratch, ignore_errors=True)
 
     total = _PASSED + len(_FAILED)

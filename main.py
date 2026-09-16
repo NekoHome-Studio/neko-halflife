@@ -30,6 +30,7 @@ runner（dify / coze / dashscope / deerflow）的工具清单来自远端平台�
 
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
 try:
-    from .core import injector, uploads
+    from .core import injector, plugin_import, uploads
     from .core.activation import ActivationStore
     from .core.models import RISK_HIGH, ToolMeta, TurnContext
     from .core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -49,7 +50,7 @@ try:
     from .core.subplugins import SubPluginLoader
     from .core.uploads import UploadError
 except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
-    from core import injector, uploads
+    from core import injector, plugin_import, uploads
     from core.activation import ActivationStore
     from core.models import RISK_HIGH, ToolMeta, TurnContext
     from core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
@@ -413,6 +414,8 @@ class LazyToolsPlugin(Star):
             ("sources/toggle", self.page_toggle_source, ["POST"], "启用或停用子插件"),
             ("subplugins/upload", self.page_upload_subplugin, ["POST"], "上传并安装子插件"),
             ("subplugins/delete", self.page_delete_subplugin, ["POST"], "删除子插件"),
+            ("plugin-import/candidates", self.page_import_candidates, ["GET"], "列出可导入的已装插件"),
+            ("plugin-import/apply", self.page_import_apply, ["POST"], "把已装插件导入为子插件"),
             ("commands", self.page_commands, ["GET"], "列出指令及其别名/权限/启停"),
             ("commands/rename", self.page_rename_command, ["POST"], "重命名指令或改别名"),
             ("commands/toggle", self.page_toggle_command, ["POST"], "启用或停用指令"),
@@ -730,6 +733,226 @@ class LazyToolsPlugin(Star):
                 "indexed": self.index.size,
             }
         )
+
+    # ---- 从已装插件导入为子插件 ------------------------------------------
+
+    @staticmethod
+    def _plugins_root() -> Path | None:
+        """AstrBot 的插件目录（data/plugins）。"""
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_plugin_path
+
+            return Path(get_astrbot_plugin_path())
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _read_plugin_metadata(plugin_dir: Path) -> dict:
+        for filename in ("metadata.yaml", "metadata.yml"):
+            path = plugin_dir / filename
+            if not path.is_file():
+                continue
+            try:
+                import yaml
+
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:  # noqa: BLE001
+                return {}
+        return {}
+
+    def _global_tool_names(self) -> set[str]:
+        try:
+            return {tool.name for tool in self.context.get_llm_tool_manager().func_list}
+        except Exception:  # noqa: BLE001
+            return set()
+
+    def _remove_global_tool(self, name: str) -> bool:
+        try:
+            self.context.get_llm_tool_manager().remove_func(name)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[neko-halflife] 清理脏注册工具 %s 失败：%s", name, exc)
+            return False
+
+    async def page_import_candidates(self):
+        """列出 data/plugins 下已安装的插件，并给出可移植性分析。"""
+        plugins_root = self._plugins_root()
+        if plugins_root is None or not plugins_root.is_dir():
+            return json_response(
+                {
+                    "supported": False,
+                    "reason": "无法定位 AstrBot 插件目录（data/plugins）。",
+                    "candidates": [],
+                }
+            )
+
+        existing = set(self.loader.discover())
+        candidates = []
+        for entry in sorted(plugins_root.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            meta = self._read_plugin_metadata(entry)
+            analysis = plugin_import.analyze_plugin_dir(entry)
+            item = analysis.to_dict()
+            item.update(
+                {
+                    "plugin_name": meta.get("name") or entry.name,
+                    "display_name": meta.get("display_name")
+                    or meta.get("name")
+                    or entry.name,
+                    "version": meta.get("version"),
+                    "desc": str(
+                        meta.get("short_desc") or meta.get("desc") or ""
+                    )[:200],
+                }
+            )
+            try:
+                target = uploads.sanitize_subplugin_name(entry.name)
+                item["target_name"] = target
+                item["already_imported"] = target in existing
+            except UploadError as exc:
+                item["target_name"] = None
+                item["already_imported"] = False
+                item["portable"] = False
+                item["reasons"] = list(item["reasons"]) + [
+                    f"目录名不能作为子插件名：{exc}"
+                ]
+            candidates.append(item)
+
+        return json_response(
+            {"supported": True, "reason": "", "candidates": candidates}
+        )
+
+    async def page_import_apply(self):
+        """把一个已装插件复制进 sub_plugins 并加载。
+
+        三道关卡：
+
+        1. **静态预检**（``core.plugin_import``）：用 AstrBot 自带工具装饰器的插件
+           直接拒绝——导入它们会有全局副作用；
+        2. **导入后校验**：比对导入前后的全局工具表，出现「不在本插件注册表里」
+           的新工具即判定为脏注册；
+        3. **失败回滚**：删掉刚复制的目录、清掉脏注册，并把覆盖前的旧版本还原。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        dir_name = str(payload.get("dir_name") or "").strip()
+        overwrite = bool(payload.get("overwrite"))
+        if not dir_name:
+            return error_response("请提供 dir_name。")
+        if "/" in dir_name or "\\" in dir_name or dir_name.startswith("."):
+            return error_response("非法的插件目录名。")
+
+        plugins_root = self._plugins_root()
+        if plugins_root is None:
+            return error_response("无法定位 AstrBot 插件目录（data/plugins）。")
+        src = plugins_root / dir_name
+        if not src.is_dir():
+            return error_response(f"插件目录不存在：{dir_name}", status_code=404)
+
+        analysis = plugin_import.analyze_plugin_dir(src)
+        if not analysis.portable:
+            return error_response(
+                "该插件不能作为子插件导入：\n- " + "\n- ".join(analysis.reasons)
+            )
+
+        try:
+            name = uploads.sanitize_subplugin_name(dir_name)
+        except UploadError as exc:
+            return error_response(str(exc))
+
+        dest = self.loader.root / name
+        if dest.exists() and not overwrite:
+            return error_response(
+                f"sub_plugins/{name} 已存在。需要替换请勾选「覆盖」后再导入。"
+            )
+
+        # 覆盖前先把旧版本挪走，失败时还原
+        backup: Path | None = None
+        if dest.exists():
+            backup = self.loader.root / ".uploads" / f"backup-{name}-{int(time.time())}"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            shutil.move(str(dest), str(backup))
+
+        before_tools = self._global_tool_names()
+        try:
+            copied = plugin_import.copy_plugin_tree(src, dest, overwrite=True)
+            plugin_import.write_entry(dest, analysis.tool_modules)
+        except Exception as exc:  # noqa: BLE001
+            self._rollback_import(dest, backup, name)
+            return error_response(f"复制失败，已回滚：{exc}")
+
+        loaded = self.loader.load(name)
+        # 脏注册 = 导入后新出现、且不在本插件注册表里的工具
+        stray = sorted(
+            tool
+            for tool in (self._global_tool_names() - before_tools)
+            if REGISTRY.get(tool) is None
+        )
+
+        if not loaded or stray:
+            for tool in stray:
+                self._remove_global_tool(tool)
+            self._rollback_import(dest, backup, name)
+            if stray:
+                return error_response(
+                    f"导入失败并已回滚：检测到 {len(stray)} 个非本插件的工具被注册"
+                    f"（{', '.join(stray[:5])}），已从全局工具表清理。"
+                    "该插件很可能用了 AstrBot 自带的工具装饰器。"
+                )
+            return error_response(
+                f"导入失败并已回滚：模块无法加载 —— "
+                f"{self.loader.errors.get(name, '未知原因')}"
+            )
+
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
+
+        self.loader.set_enabled(name, True)
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
+        self._persist_sub_plugins()
+
+        installed = [m.name for m in REGISTRY.all() if m.source == name]
+        logger.warning(
+            "[neko-halflife] 已从插件 %s 导入 %d 个文件为子插件 %s（%d 个工具：%s）",
+            dir_name,
+            copied,
+            name,
+            len(installed),
+            ", ".join(installed[:5]) or "无",
+        )
+        return json_response(
+            {
+                "name": name,
+                "source": dir_name,
+                "files": copied,
+                "tools": installed,
+                "warnings": analysis.warnings,
+                "indexed": self.index.size,
+            }
+        )
+
+    def _rollback_import(self, dest: Path, backup: Path | None, name: str) -> None:
+        """回滚一次导入：清注册、删新目录、还原旧版本。"""
+        self._forget_source_tools(name)
+        self.loader.loaded.discard(name)
+        self.loader.errors.pop(name, None)
+        shutil.rmtree(dest, ignore_errors=True)
+        if backup is not None and backup.exists():
+            try:
+                shutil.move(str(backup), str(dest))
+                self.loader.load(name)
+                logger.warning("[neko-halflife] 已还原子插件 %s 的旧版本", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[neko-halflife] 还原子插件 %s 失败：%s", name, exc)
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
 
     # ---- 指令面板：AstrBot 官方 command_management 的薄前端 ----------------
 

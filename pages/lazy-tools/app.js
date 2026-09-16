@@ -90,6 +90,9 @@ const dom = {
   uploadInput: document.getElementById("upload-input"),
   uploadButton: document.getElementById("upload-button"),
   uploadResult: document.getElementById("upload-result"),
+  importTitle: document.getElementById("import-title"),
+  importHint: document.getElementById("import-hint"),
+  importBody: document.getElementById("import-body"),
   commandsTitle: document.getElementById("commands-title"),
   commandsSummary: document.getElementById("commands-summary"),
   commandsBody: document.getElementById("commands-body"),
@@ -193,6 +196,12 @@ function applyLabels() {
     "支持单个 .py 或含 __init__.py 的 .zip 包；同名已存在时请先删除",
   );
   dom.uploadButton.textContent = t("pages.lazy-tools.install", "安装");
+
+  dom.importTitle.textContent = t("pages.lazy-tools.import", "从已装插件导入");
+  dom.importHint.textContent = t(
+    "pages.lazy-tools.import_hint",
+    "把 data/plugins 下插件的源码复制进 sub_plugins/；只接受用 @lazy_tool 写的普通函数工具集",
+  );
 
   dom.commandsTitle.textContent = t("pages.lazy-tools.commands", "指令面板");
 }
@@ -511,6 +520,7 @@ async function loadState(force = false) {
     }
     if (!force) setBadge(t("pages.lazy-tools.synced", "已同步"), "ok");
     await loadCommands();
+    await loadImportCandidates();
   } catch (error) {
     showError(error?.message || String(error));
     setBadge(t("pages.lazy-tools.failed", "读取失败"), "danger");
@@ -615,6 +625,124 @@ async function deleteSubplugin(name) {
     showToast(
       `已删除 ${result.name}（文件${result.removed_files ? "已删除" : "不存在"}，工具 ${result.removed_tools} 个）`,
     );
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 从已装插件导入为子插件                                              */
+/* ------------------------------------------------------------------ */
+
+async function loadImportCandidates() {
+  clear(dom.importBody);
+  let payload;
+  try {
+    payload = await callGet("plugin-import/candidates");
+  } catch (error) {
+    dom.importBody.append(
+      el("div", "empty", `读取插件列表失败：${error?.message || error}`),
+    );
+    return;
+  }
+  if (!payload.supported) {
+    dom.importBody.append(
+      el("div", "empty", payload.reason || "此环境无法列出自装插件。"),
+    );
+    return;
+  }
+  const candidates = payload.candidates || [];
+  if (!candidates.length) {
+    dom.importBody.append(el("div", "empty", "data/plugins 下没有其它插件。"));
+    return;
+  }
+
+  const list = el("div", "import-list");
+  for (const item of candidates) {
+    list.append(importRow(item));
+  }
+  dom.importBody.append(list);
+}
+
+function importRow(item) {
+  const row = el("div", "import-item");
+
+  const head = el("div", "import-head");
+  const title = el("div", "import-title-cell");
+  title.append(
+    el("span", "source-name", item.display_name || item.dir_name),
+    el("span", "muted", ` ${item.dir_name}${item.version ? ` · v${item.version}` : ""}`),
+  );
+  head.append(title);
+
+  const badges = el("div", "import-badges");
+  badges.append(
+    item.portable
+      ? el("span", "badge badge-ok", "可导入")
+      : el("span", "badge badge-danger", "不可导入"),
+  );
+  if (item.already_imported) badges.append(el("span", "badge badge-warn", "已导入"));
+  head.append(badges);
+  row.append(head);
+
+  if (item.desc) row.append(el("div", "muted", item.desc));
+
+  if (item.portable && item.lazy_tool_names?.length) {
+    row.append(
+      el("div", "muted", `检测到工具：${item.lazy_tool_names.join(", ")}`),
+    );
+  }
+
+  for (const reason of item.reasons || []) {
+    row.append(el("div", "import-reason", reason));
+  }
+  for (const warning of item.warnings || []) {
+    row.append(el("div", "import-warning", warning));
+  }
+
+  const actions = el("div", "import-actions");
+  const button = el(
+    "button",
+    "btn btn-small btn-primary",
+    item.already_imported ? "覆盖导入" : "导入",
+  );
+  button.type = "button";
+  button.disabled = !item.portable || !item.target_name;
+  button.addEventListener("click", () =>
+    importPlugin(item.dir_name, item.already_imported),
+  );
+  actions.append(button);
+  row.append(actions);
+
+  return row;
+}
+
+async function importPlugin(dirName, overwrite) {
+  if (busy) return;
+  if (
+    overwrite &&
+    !window.confirm(`覆盖导入会替换 sub_plugins 下已有的同名子插件，继续？`)
+  ) {
+    return;
+  }
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("plugin-import/apply", {
+      dir_name: dirName,
+      overwrite: Boolean(overwrite),
+    });
+    showToast(
+      `已导入 ${result.name}：${result.files} 个文件，${
+        (result.tools || []).length
+      } 个工具`,
+    );
+    if (result.warnings?.length) {
+      dom.uploadResult.textContent = `导入 ${result.name} 的提醒：${result.warnings.join("；")}`;
+    }
     await loadState(true);
   } catch (error) {
     showError(error?.message || String(error));

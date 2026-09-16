@@ -554,3 +554,59 @@ input:focus {
 #commands-body .table td {
   vertical-align: middle;
 }
+
+/* ---- 从已装插件导入 ---- */
+
+.import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.import-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.import-title-cell {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.import-badges {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.import-reason {
+  color: var(--danger);
+  font-size: 12.5px;
+  padding-left: 10px;
+  border-left: 3px solid var(--danger);
+}
+
+.import-warning {
+  color: var(--warn);
+  font-size: 12.5px;
+  padding-left: 10px;
+  border-left: 3px solid var(--warn);
+}
+
+.import-actions {
+  margin-top: 4px;
+}

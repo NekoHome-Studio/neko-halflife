@@ -42,6 +42,8 @@
       "upload": "Upload sub-plugin",
       "upload_hint": "A single .py file, or a .zip containing __init__.py; delete the existing one first if the name is taken",
       "install": "Install",
+      "import": "Import from an installed plugin",
+      "import_hint": "Copy a plugin's source from data/plugins into sub_plugins/; only plain-function tool sets written with @lazy_tool are accepted",
       "commands": "Command panel"
     }
   }

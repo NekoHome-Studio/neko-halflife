@@ -42,6 +42,8 @@
       "upload": "上传子插件",
       "upload_hint": "支持单个 .py 或含 __init__.py 的 .zip 包；同名已存在时请先删除",
       "install": "安装",
+      "import": "从已装插件导入",
+      "import_hint": "把 data/plugins 下插件的源码复制进 sub_plugins/；只接受用 @lazy_tool 写的普通函数工具集",
       "commands": "指令面板"
     }
   }
