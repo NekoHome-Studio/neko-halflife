@@ -619,3 +619,17 @@ input:focus {
   margin-bottom: 10px;
   flex-wrap: wrap;
 }
+
+.row-actions {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+#tools-body .table td {
+  vertical-align: middle;
+}
+
+#tools-body .cmd-input {
+  min-width: 180px;
+}

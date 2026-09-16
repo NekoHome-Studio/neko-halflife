@@ -43,17 +43,19 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
 try:
-    from .core import injector, plugin_host, plugin_import, uploads
+    from .core import enrich, injector, plugin_host, plugin_import, uploads
     from .core.activation import ActivationStore
     from .core.models import RISK_HIGH, ToolMeta, TurnContext
+    from .core.overrides import OVERRIDES, default_override_path
     from .core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
     from .core.retriever import ToolIndex
     from .core.subplugins import SubPluginLoader
     from .core.uploads import UploadError
 except ImportError:  # AstrBot 也支持把 main.py 当普通模块载入
-    from core import injector, plugin_host, plugin_import, uploads
+    from core import enrich, injector, plugin_host, plugin_import, uploads
     from core.activation import ActivationStore
     from core.models import RISK_HIGH, ToolMeta, TurnContext
+    from core.overrides import OVERRIDES, default_override_path
     from core.registry import REGISTRY, RESULT_LIMITS, lazy_tool
     from core.retriever import ToolIndex
     from core.subplugins import SubPluginLoader
@@ -92,6 +94,8 @@ class LazyToolsPlugin(Star):
         self._turns: dict[str, TurnContext] = {}
         #: 宿主模式下的子插件实例（name -> HostResult），删除/卸载时要停掉它们
         self._hosted: dict[str, Any] = {}
+        #: 工具元数据覆盖（手动改的标签/描述 + LLM 总结结果），落盘在插件数据目录
+        OVERRIDES.path = default_override_path(PLUGIN_NAME)
         self._apply_config(config)
         self._register_web_apis()
 
@@ -105,7 +109,11 @@ class LazyToolsPlugin(Star):
         索引必须在子插件导入之后建，否则子插件的工具不会进入检索候选。
         """
         self._apply_config(self.config)
+        # 覆盖项要在建索引之前施加，否则检索用的是被冲回基线的元数据
+        OVERRIDES.load()
+        OVERRIDES.apply_all(REGISTRY)
         await self._load_sub_plugins()
+        OVERRIDES.apply_all(REGISTRY)
         self._rebuild_index()
         self.activation.drop_stale(frozenset(REGISTRY.names()))
         logger.info(
@@ -433,6 +441,9 @@ class LazyToolsPlugin(Star):
             ("commands/rename", self.page_rename_command, ["POST"], "重命名指令或改别名"),
             ("commands/toggle", self.page_toggle_command, ["POST"], "启用或停用指令"),
             ("commands/permission", self.page_set_command_permission, ["POST"], "设置指令权限"),
+            ("tools/update", self.page_update_tool, ["POST"], "手动修改工具的标签与描述"),
+            ("tools/reset", self.page_reset_tool, ["POST"], "撤销工具的手动覆盖"),
+            ("tools/enrich", self.page_enrich_tools, ["POST"], "用 LLM 总结工具描述与标签"),
         )
         for suffix, handler, methods, description in routes:
             try:
@@ -477,6 +488,12 @@ class LazyToolsPlugin(Star):
                 "max_result_chars": meta.max_result_chars or RESULT_LIMITS.get("default"),
                 "enabled": meta.source == "main"
                 or REGISTRY.is_source_enabled(meta.source),
+                "overridden": OVERRIDES.get(meta.name) is not None,
+                "override_source": (
+                    OVERRIDES.get(meta.name).source
+                    if OVERRIDES.get(meta.name) is not None
+                    else None
+                ),
             }
             for meta in sorted(REGISTRY.all(), key=lambda m: (m.source, m.name))
         ]
@@ -752,6 +769,13 @@ class LazyToolsPlugin(Star):
         self._persist_sub_plugins()
 
         installed = len(source_tools)
+        # 与导入路径同一套：上传的常规插件工具也补一次检索元数据
+        enrich_report = None
+        if self._llm_enrich and self._llm_enrich_max and source_tools:
+            try:
+                enrich_report = await self._enrich_tools(source_tools, only_missing=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[neko-halflife] 上传后的 LLM 总结已跳过：%s", exc)
         logger.warning(
             "[neko-halflife] 已通过 WebUI 安装子插件 %s（%s，模式 %s，%d 个工具）",
             name,
@@ -766,6 +790,7 @@ class LazyToolsPlugin(Star):
                 "mode": mode,
                 "tools": installed,
                 "bound_handlers": bound_handlers,
+                "enrich": enrich_report,
                 "indexed": self.index.size,
                 "kind": "zip" if is_zip else "single_file",
             }
@@ -1083,6 +1108,14 @@ class LazyToolsPlugin(Star):
         self._persist_sub_plugins()
 
         installed = list(source_tools)
+        # 导入后（可选）用 LLM 总结检索元数据：外来工具的原描述是写给读代码的人看的，
+        # 不一定含用户会说的词，补标签对召回帮助最大。失败不影响导入结果。
+        enrich_report = None
+        if self._llm_enrich and self._llm_enrich_max:
+            try:
+                enrich_report = await self._enrich_tools(installed, only_missing=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[neko-halflife] 导入后的 LLM 总结已跳过：%s", exc)
         logger.warning(
             "[neko-halflife] 已从插件 %s 导入 %d 个文件为子插件 %s（模式 %s，"
             "%d 个工具：%s）",
@@ -1103,6 +1136,7 @@ class LazyToolsPlugin(Star):
                 "bound_handlers": list(bound_handlers),
                 "warnings": list(analysis.warnings)
                 + (list(host_result.warnings) if host_result is not None else []),
+                "enrich": enrich_report,
                 "indexed": self.index.size,
             }
         )
@@ -1266,6 +1300,135 @@ class LazyToolsPlugin(Star):
             }
         )
 
+    # ---- 工具元数据：手动覆盖 + LLM 总结 --------------------------------
+
+    def _provider(self) -> Any | None:
+        """取当前默认的对话模型；拿不到就返回 None（调用方据此降级）。"""
+        try:
+            return self.context.get_using_provider()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[neko-halflife] 获取对话模型失败：%s", exc)
+            return None
+
+    async def _enrich_tools(
+        self, names: list[str] | None = None, *, only_missing: bool = True
+    ) -> dict:
+        """用 LLM 给工具生成 summary/tags，写入覆盖层。失败不抛异常。"""
+        briefs = enrich.collect_briefs(REGISTRY, names, only_missing=only_missing)
+        considered = len(briefs)
+        if self._llm_enrich_max:
+            briefs = briefs[: self._llm_enrich_max]
+        if not briefs:
+            return {
+                "updated": {},
+                "errors": [],
+                "skipped": [],
+                "considered": considered,
+                "sent": 0,
+            }
+
+        result = await enrich.enrich(
+            self._provider(), briefs, timeout=self._llm_enrich_timeout
+        )
+        for name, payload in result.updated.items():
+            # source="llm"：不会盖掉用户手改过的同名覆盖
+            OVERRIDES.set(
+                name,
+                tags=payload.get("tags"),
+                description=payload.get("summary"),
+                source="llm",
+            )
+        if result.updated:
+            OVERRIDES.apply_all(REGISTRY)
+            OVERRIDES.save()
+            self._rebuild_index()
+        return {
+            "updated": result.updated,
+            "errors": result.errors,
+            "skipped": result.skipped,
+            "considered": considered,
+            "sent": len(briefs),
+        }
+
+    async def page_update_tool(self):
+        """手动改一个工具的标签/描述。写进覆盖层，**不动源码**。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return error_response("请提供 name。")
+        if REGISTRY.get(name) is None:
+            return error_response(f"没有名为 {name} 的工具。", status_code=404)
+        has_tags = "tags" in payload
+        has_desc = "description" in payload
+        if not has_tags and not has_desc:
+            return error_response("请至少提供 tags 或 description。")
+
+        override = OVERRIDES.set(
+            name,
+            # 传 None 表示"这一项不动"，传 [] 表示"显式清空"
+            tags=payload.get("tags") if has_tags else None,
+            description=payload.get("description") if has_desc else None,
+            source="manual",
+        )
+        OVERRIDES.apply_all(REGISTRY)
+        persisted = OVERRIDES.save()
+        self._rebuild_index()
+        meta = REGISTRY.get(name)
+        return json_response(
+            {
+                "name": name,
+                "tags": list(meta.tags) if meta else [],
+                "description": meta.description if meta else "",
+                "source": override.source,
+                "persisted": persisted,
+                "indexed": self.index.size,
+            }
+        )
+
+    async def page_reset_tool(self):
+        """撤销一个工具的覆盖，退回代码里的基线。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return error_response("请提供 name。")
+        removed = OVERRIDES.remove(name)
+        OVERRIDES.apply_all(REGISTRY)
+        OVERRIDES.save()
+        self._rebuild_index()
+        meta = REGISTRY.get(name)
+        return json_response(
+            {
+                "name": name,
+                "removed": removed,
+                "tags": list(meta.tags) if meta else [],
+                "description": meta.description if meta else "",
+                "indexed": self.index.size,
+            }
+        )
+
+    async def page_enrich_tools(self):
+        """用 LLM 总结工具的检索元数据。
+
+        默认 ``only_missing=True``：只补"还没有标签"的工具，避免把用户手写好的
+        标签再总结一遍（既费 token 又可能覆盖掉好的）。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象。")
+        raw_names = payload.get("names")
+        names = (
+            [str(item).strip() for item in raw_names if str(item).strip()]
+            if isinstance(raw_names, list)
+            else None
+        )
+        only_missing = bool(payload.get("only_missing", True))
+        result = await self._enrich_tools(names, only_missing=only_missing)
+        return json_response(result)
+
     # ------------------------------------------------------------------
     # 内部工具方法
     # ------------------------------------------------------------------
@@ -1287,6 +1450,9 @@ class LazyToolsPlugin(Star):
             max(int(get("max_subplugin_upload_kb", 2048) or 0), 0) * 1024
         )
         self._cmd_panel_enabled = bool(get("enable_command_panel", False))
+        self._llm_enrich = bool(get("llm_enrich_on_import", True))
+        self._llm_enrich_max = max(int(get("llm_enrich_max_tools", 20) or 0), 0)
+        self._llm_enrich_timeout = max(float(get("llm_enrich_timeout", 60) or 0.0), 5.0)
         self._debug = bool(get("debug", False))
         self._search_top_k = max(self._top_k, 5) if self._top_k else 5
 
@@ -1350,6 +1516,8 @@ class LazyToolsPlugin(Star):
 
         for meta in result.tool_metas:
             REGISTRY.register(meta)
+        # 新注册的工具要立刻施加已有覆盖（例如上次 LLM 总结的结果）
+        OVERRIDES.apply_all(REGISTRY)
         self._hosted[name] = result
         self._rebuild_index()
         for warning in result.warnings:

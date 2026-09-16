@@ -1078,6 +1078,149 @@ def main() -> int:
         plugin_import.analyze_plugin_dir = real_analyze
         shutil.rmtree(scratch, ignore_errors=True)
 
+    print()
+    print("16. 工具标签：手动覆盖与 LLM 总结")
+
+    overrides_mod = importlib.import_module(f"{PKG_ALIAS}.core.overrides")
+    models_mod = importlib.import_module(f"{PKG_ALIAS}.core.models")
+    OVERRIDES = overrides_mod.OVERRIDES
+    ToolMeta = models_mod.ToolMeta
+
+    scratch = PLUGIN_ROOT / ".selftest-scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    OVERRIDES.path = scratch / "tool_overrides.json"
+    real_ctx2 = plugin.context
+    try:
+        registered5: list[tuple[str, list[str]]] = []
+
+        class FakeProvider:
+            def __init__(self):
+                self.calls = 0
+
+            async def text_chat(self, prompt=None, system_prompt=None, **kwargs):
+                self.calls += 1
+                return types.SimpleNamespace(
+                    completion_text=(
+                        '{"meta_test_tool": {"summary": "把用户的话原样回显",'
+                        ' "tags": ["回显", "复述", "echo"]}}'
+                    )
+                )
+
+        provider = FakeProvider()
+
+        class FakeContext5:
+            def register_web_api(self, route, handler, methods, description):
+                registered5.append((route, list(methods)))
+
+            def get_llm_tool_manager(self):
+                return llm_tools
+
+            def get_using_provider(self):
+                return provider
+
+        plugin.context = FakeContext5()
+        plugin._register_web_apis()
+        routes5 = dict(registered5)
+        for suffix in ("tools/update", "tools/reset", "tools/enrich"):
+            route = f"/{plugin_main.PLUGIN_NAME}/{suffix}"
+            check(routes5.get(route) == ["POST"], f"注册了路由 {route} [POST]")
+
+        # 造一个"原描述含糊、没有任何标签"的工具（正是导入进来的工具的样子）
+        REGISTRY.register(
+            ToolMeta(
+                name="meta_test_tool",
+                description="vague description",
+                module="smoke.main",
+                source="smoke",
+            )
+        )
+        OVERRIDES.apply_all(REGISTRY)
+        plugin._rebuild_index()
+
+        # ---- 手动改标签 ----
+        plugin_main.request = FakeWebRequest(
+            {
+                "name": "meta_test_tool",
+                "tags": ["北京天气", "气温"],
+                "description": "查天气",
+            }
+        )
+        payload = body_of(asyncio.run(plugin.page_update_tool()))
+        check(
+            payload.get("tags") == ["北京天气", "气温"],
+            f"手动改标签生效：{payload.get('tags')}",
+        )
+        meta = REGISTRY.get("meta_test_tool")
+        check(meta.tags == ("北京天气", "气温"), "注册表里的 meta 已更新")
+        check(OVERRIDES.get("meta_test_tool").source == "manual", "标记为手动来源")
+        hits = plugin.index.search("北京天气怎么样", top_k=3, min_score=0.3)
+        check(
+            bool(hits) and hits[0][0].name == "meta_test_tool",
+            "改完标签立刻能被召回（索引已重建）",
+        )
+        check((scratch / "tool_overrides.json").is_file(), "覆盖已落盘")
+
+        # ---- LLM 总结不覆盖手改 ----
+        plugin_main.request = FakeWebRequest({"only_missing": False})
+        payload = body_of(asyncio.run(plugin.page_enrich_tools()))
+        check(payload.get("sent", 0) >= 1, f"LLM 总结送出 {payload.get('sent')} 个工具")
+        check(provider.calls == 1, "确实调用了模型")
+        check(
+            OVERRIDES.get("meta_test_tool").tags == ["北京天气", "气温"],
+            "LLM 没有盖掉用户手改的标签",
+        )
+
+        # ---- 重置回基线 ----
+        plugin_main.request = FakeWebRequest({"name": "meta_test_tool"})
+        body_of(asyncio.run(plugin.page_reset_tool()))
+        check(meta.tags == (), "重置后标签回到基线（原本没有标签）")
+        check(meta.description == "vague description", "重置后描述回到基线")
+
+        # ---- only_missing=True 时才轮到 LLM 补 ----
+        plugin_main.request = FakeWebRequest({"only_missing": True})
+        payload = body_of(asyncio.run(plugin.page_enrich_tools()))
+        check(
+            "meta_test_tool" in (payload.get("updated") or {}),
+            f"LLM 结果已写入：{list((payload.get('updated') or {}).keys())}",
+        )
+        check(meta.tags == ("回显", "复述", "echo"), f"标签来自 LLM：{meta.tags}")
+        check(OVERRIDES.get("meta_test_tool").source == "llm", "标记为 LLM 来源")
+        check(meta.description == "把用户的话原样回显", "描述被总结替换")
+        hits = plugin.index.search("帮我把这句话复述一遍", top_k=3, min_score=0.3)
+        check(
+            bool(hits) and hits[0][0].name == "meta_test_tool",
+            "LLM 补的标签同样能召回到",
+        )
+
+        # ---- 模型不可用时只报错、不崩 ----
+        class NoProviderContext:
+            def register_web_api(self, *args):
+                pass
+
+            def get_llm_tool_manager(self):
+                return llm_tools
+
+        plugin.context = NoProviderContext()
+        # 注意用 only_missing=False：此时该工具已有标签，only_missing=True 会没有候选，
+        # 那条路径压根不需要 provider，测不到"取不到模型"的分支。
+        plugin_main.request = FakeWebRequest({"only_missing": False})
+        resp = asyncio.run(plugin.page_enrich_tools())
+        body = body_of(resp)
+        check(resp.status_code == 200, "取不到对话模型时不返回 500")
+        check(
+            any("对话模型" in str(item) for item in body.get("errors") or []),
+            f"给出可读错误：{body.get('errors')}",
+        )
+        check(body.get("updated") == {}, "取不到模型时不写入任何覆盖")
+    finally:
+        plugin.context = real_ctx2
+        OVERRIDES.remove("meta_test_tool")
+        REGISTRY.forget_source("smoke")
+        OVERRIDES.apply_all(REGISTRY)
+        OVERRIDES.path = None
+        plugin._rebuild_index()
+        shutil.rmtree(scratch, ignore_errors=True)
+
     total = _PASSED + len(_FAILED)
     print()
     print(f"通过 {_PASSED}/{total}")

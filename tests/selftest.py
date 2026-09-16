@@ -613,6 +613,136 @@ def _plugin_import_body(raw: Path) -> None:
     )
 
 
+def test_overrides_store() -> None:
+    print("overrides / 覆盖层：施加、重置、落盘")
+    import shutil
+
+    from core.overrides import OverrideStore, normalize_tags
+
+    check(normalize_tags("天气, 气温 ,天气") == ["天气", "气温"], "字符串去重去空白")
+    check(normalize_tags(["a", "#b", "  "]) == ["a", "b"], "列表去井号与空项")
+    check(len(normalize_tags([f"t{i}" for i in range(50)])) <= 12, "标签数量有上限")
+    check(normalize_tags(None) == [], "None 得到空列表")
+    check(normalize_tags("中文，全角逗号") == ["中文", "全角逗号"], "全角逗号也切分")
+
+    scratch = PLUGIN_ROOT / ".selftest-scratch" / "overrides"
+    if scratch.exists():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+
+    store = OverrideStore(scratch / "ov.json")
+    meta = ToolMeta(
+        name="t1", description="基线描述", module="m", source="main", tags=("原始",)
+    )
+    store.apply(meta)
+    check(meta.tags == ("原始",) and meta.description == "基线描述", "无覆盖时等于基线")
+
+    store.set("t1", tags=["新标签", "另一个"], source="manual")
+    store.apply(meta)
+    check(meta.tags == ("新标签", "另一个"), "覆盖生效")
+    check(meta.description == "基线描述", "只覆盖 tags 时描述保持基线")
+
+    store.set("t1", tags=["手改"], source="manual")
+    store.set("t1", tags=["llm改的"], source="llm")
+    store.apply(meta)
+    check(meta.tags == ("手改",), "LLM 覆盖不会盖掉用户手改")
+
+    store.apply_all.__self__  # noqa: B018 - 仅确认方法存在
+    check(store.save() is True, "落盘成功")
+    reloaded = OverrideStore(scratch / "ov.json")
+    check(reloaded.load() == 1, "重新加载读回 1 条覆盖")
+    check(reloaded.get("t1").tags == ["手改"], "落盘内容正确")
+
+    store.set("t1", tags=[], source="manual")
+    store.apply(meta)
+    check(meta.tags == (), "显式传空列表 = 清空标签（与 None 区分）")
+
+    store.remove("t1")
+    store.apply(meta)
+    check(meta.tags == ("原始",), "重置退回基线标签")
+    check(meta.description == "基线描述", "重置退回基线描述")
+    check(store.forget_missing({"other"}) == 0, "forget_missing 对不存在的名字是空操作")
+
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_tags_drive_retrieval() -> None:
+    print("overrides / 标签改动真的影响召回（本功能的意义所在）")
+    from core.overrides import OverrideStore
+
+    store = OverrideStore()
+    meta = ToolMeta(
+        name="legacy_tool",
+        description="do something vague",
+        module="m",
+        source="main",
+        tags=(),
+    )
+    index = ToolIndex()
+    index.build([meta])
+    check(
+        index.search("帮我查一下北京的天气", top_k=3, min_score=0.3) == [],
+        "无标签时口语查询召回不到",
+    )
+
+    store.apply(meta)
+    store.set("legacy_tool", tags=["天气", "气温", "weather"], source="manual")
+    store.apply(meta)
+    index.build([meta])
+    hits = index.search("帮我查一下北京的天气", top_k=3, min_score=0.3)
+    check(
+        bool(hits) and hits[0][0].name == "legacy_tool",
+        "补上标签后同一句话就能召回",
+    )
+
+
+def test_enrich_parsing() -> None:
+    print("enrich / 模型输出的多级兜底解析")
+    from core.enrich import collect_briefs, parse_enrichment
+
+    plain = '{"t1": {"summary": "查天气", "tags": ["天气", "气温"]}}'
+    check(parse_enrichment(plain)["t1"]["tags"] == ["天气", "气温"], "纯 JSON 直接解析")
+
+    fenced = '```json\n{"t1": {"summary": "查天气", "tags": ["天气"]}}\n```'
+    check("t1" in parse_enrichment(fenced), "剥掉 ``` 围栏")
+
+    noisy = '好的，结果如下：\n{"t1": {"summary": "查天气", "tags": ["天气"]}}\n希望有帮助！'
+    check("t1" in parse_enrichment(noisy), "从寒暄噪声里抠出配平的对象")
+
+    nested = '{"tools": {"t1": {"summary": "x", "tags": ["a"]}}}'
+    check("t1" in parse_enrichment(nested), "识别被 tools 包了一层的形状")
+
+    as_list = '[{"name": "t1", "summary": "x", "tags": ["a"]}]'
+    check("t1" in parse_enrichment(as_list), "识别数组形状")
+
+    string_form = '{"t1": "查天气"}'
+    check(
+        parse_enrichment(string_form)["t1"]["summary"] == "查天气",
+        "值为字符串时当作 summary",
+    )
+
+    check(parse_enrichment("完全不是 JSON") == {}, "纯文本返回空（不抛错）")
+    check(parse_enrichment("") == {}, "空串返回空")
+    check(parse_enrichment('{"t1": {"tags": ["a"]}}', {"other"}) == {}, "过滤掉未请求的工具名")
+    check(
+        parse_enrichment('{"t1": {"tags": ["  ", "#"]}}') == {},
+        "只有空标签时视为没有产出",
+    )
+
+    registry = ToolRegistry()
+    tagged = ToolMeta(name="has_tags", description="d", module="m", tags=("已有",))
+    untagged = ToolMeta(name="no_tags", description="d", module="m", tags=())
+    registry.register(tagged)
+    registry.register(untagged)
+    only_missing = collect_briefs(registry, None, only_missing=True)
+    check(
+        [brief.name for brief in only_missing] == ["no_tags"],
+        "only_missing 只挑没有标签的",
+    )
+    all_briefs = collect_briefs(registry, None, only_missing=False)
+    check(len(all_briefs) == 2, "only_missing=False 时全都送")
+
+
 def main() -> int:
     for test in (
         test_tokenize,
@@ -633,6 +763,9 @@ def main() -> int:
         test_zip_plan_rejects,
         test_install_roundtrip,
         test_plugin_import_analysis,
+        test_overrides_store,
+        test_tags_drive_retrieval,
+        test_enrich_parsing,
     ):
         test()
         print()

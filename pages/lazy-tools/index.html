@@ -55,16 +55,23 @@
           <h2 id="tools-title">工具清单</h2>
           <span class="muted" id="tools-summary"></span>
         </div>
+        <div class="panel-toolbar">
+          <span class="muted" id="tools-hint"></span>
+          <button id="enrich-button" type="button" class="btn btn-small">
+            用 LLM 补全标签
+          </button>
+        </div>
         <div class="table-wrap">
           <table class="table">
             <thead>
               <tr>
                 <th id="th-name">工具名</th>
                 <th id="th-source">来源</th>
-                <th id="th-tags">标签</th>
+                <th id="th-tags">标签（逗号分隔，可直接改）</th>
                 <th id="th-ttl">存活</th>
                 <th id="th-risk">风险</th>
-                <th id="th-desc">描述</th>
+                <th id="th-desc">描述（可直接改）</th>
+                <th id="th-actions"></th>
               </tr>
             </thead>
             <tbody id="tools-body"></tbody>

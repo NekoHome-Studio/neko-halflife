@@ -83,6 +83,24 @@
     "default": false,
     "hint": "在 Pages 面板里列出所有指令并支持改指令名/别名、启停、权限。这是 AstrBot 的通用管理功能（复用官方 command_management，与 dashboard 自带的指令管理数据同源），与本插件「懒加载工具」主题无关，为保持插件定位清晰默认关闭。需要 AstrBot 提供 astrbot.core.star.command_management，缺失时面板会显示不支持而不影响其它功能"
   },
+  "llm_enrich_on_import": {
+    "description": "导入工具时用 LLM 总结标签",
+    "type": "bool",
+    "default": true,
+    "hint": "导入/上传子插件后，调用一次当前对话模型，把工具的原描述改写成「用户会怎么问」并生成检索标签。外来工具的原描述是写给读代码的人看的，往往不含用户会说的词，补标签对懒加载召回帮助最大。会消耗 token；失败只跳过，不影响导入。面板上也可随时手动点击总结"
+  },
+  "llm_enrich_max_tools": {
+    "description": "单次最多总结多少个工具",
+    "type": "int",
+    "default": 20,
+    "hint": "限制一次请求的 prompt 规模与费用。0 表示关闭 LLM 总结（含导入时的自动总结）"
+  },
+  "llm_enrich_timeout": {
+    "description": "LLM 总结超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "导入是同步等待的，超时就跳过总结、照常完成导入，不会卡住"
+  },
   "debug": {
     "description": "输出每轮注入明细日志",
     "type": "bool",

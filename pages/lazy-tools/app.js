@@ -72,6 +72,8 @@ const dom = {
   searchResult: document.getElementById("search-result"),
   toolsTitle: document.getElementById("tools-title"),
   toolsSummary: document.getElementById("tools-summary"),
+  toolsHint: document.getElementById("tools-hint"),
+  enrichButton: document.getElementById("enrich-button"),
   toolsBody: document.getElementById("tools-body"),
   thName: document.getElementById("th-name"),
   thSource: document.getElementById("th-source"),
@@ -178,6 +180,11 @@ function applyLabels() {
   dom.searchButton.textContent = t("pages.lazy-tools.run", "试跑");
 
   dom.toolsTitle.textContent = t("pages.lazy-tools.tools", "工具清单");
+  dom.toolsHint.textContent = t(
+    "pages.lazy-tools.tools_hint",
+    "标签是懒加载的召回依据，可直接编辑后保存；改动只写入覆盖层，不动源码",
+  );
+  dom.enrichButton.textContent = t("pages.lazy-tools.enrich", "用 LLM 补全标签");
   dom.thName.textContent = t("pages.lazy-tools.col_name", "工具名");
   dom.thSource.textContent = t("pages.lazy-tools.col_source", "来源");
   dom.thTags.textContent = t("pages.lazy-tools.col_tags", "标签");
@@ -255,7 +262,7 @@ function renderTools(tools) {
   if (!tools.length) {
     const row = el("tr");
     const cell = el("td", "empty", "还没有注册任何工具。");
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     row.append(cell);
     dom.toolsBody.append(row);
     return;
@@ -272,20 +279,27 @@ function renderTools(tools) {
     if (tool.always_active) {
       nameCell.append(el("span", "badge badge-neutral", "常驻"));
     }
+    if (tool.overridden) {
+      nameCell.append(
+        el(
+          "span",
+          "badge badge-ok",
+          tool.override_source === "llm" ? "LLM 已补" : "已手改",
+        ),
+      );
+    }
     row.append(nameCell);
 
     row.append(el("td", "muted", tool.source));
 
-    const tagCell = el("td");
-    const tags = el("div", "tags");
-    const tagList = (tool.tags || []).slice(0, 6);
-    if (tagList.length) {
-      for (const tag of tagList) tags.append(el("span", "tag", tag));
-    } else {
-      tags.append(el("span", "muted", "—"));
-    }
-    tagCell.append(tags);
-    row.append(tagCell);
+    const tagsCell = el("td");
+    const tagsInput = document.createElement("input");
+    tagsInput.type = "text";
+    tagsInput.className = "cmd-input";
+    tagsInput.value = (tool.tags || []).join(", ");
+    tagsInput.placeholder = "还没有标签，可点右侧「用 LLM 补全标签」";
+    tagsCell.append(tagsInput);
+    row.append(tagsCell);
 
     const ttl = tool.ttl_seconds
       ? `${tool.ttl_turns} 轮 / ${tool.ttl_seconds}s`
@@ -300,9 +314,32 @@ function renderTools(tools) {
     );
     row.append(riskCell);
 
-    const desc = el("td", "desc-cell", tool.description);
-    desc.title = tool.description || "";
-    row.append(desc);
+    const descCell = el("td");
+    const descInput = document.createElement("input");
+    descInput.type = "text";
+    descInput.className = "cmd-input";
+    descInput.value = tool.description || "";
+    descInput.title = tool.description || "";
+    descCell.append(descInput);
+    row.append(descCell);
+
+    const actionCell = el("td");
+    const actions = el("div", "row-actions");
+    const save = el("button", "btn btn-small", "保存");
+    save.type = "button";
+    save.addEventListener("click", () =>
+      saveTool(tool.name, tagsInput.value, descInput.value),
+    );
+    const reset = el("button", "btn btn-small", "重置");
+    reset.type = "button";
+    reset.disabled = !tool.overridden;
+    reset.title = reset.disabled
+      ? "没有覆盖项可重置"
+      : "退回代码里写的基线标签与描述";
+    reset.addEventListener("click", () => resetTool(tool.name));
+    actions.append(save, reset);
+    actionCell.append(actions);
+    row.append(actionCell);
 
     dom.toolsBody.append(row);
   }
@@ -672,6 +709,83 @@ async function deleteSubplugin(name) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 工具标签：手动改 + LLM 补全                                          */
+/* ------------------------------------------------------------------ */
+
+async function saveTool(name, tagsText, description) {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    const tags = String(tagsText || "")
+      .split(/[,，、]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const result = await callPost("tools/update", {
+      name,
+      tags,
+      description: String(description || ""),
+    });
+    showToast(
+      `${name} 已保存（${(result.tags || []).length} 个标签）` +
+        (result.persisted ? "" : "；但覆盖文件写入失败，重启后会丢失"),
+    );
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function resetTool(name) {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("tools/reset", { name });
+    showToast(
+      result.removed
+        ? `${name} 已重置回代码里的基线`
+        : `${name} 本来就没有覆盖项`,
+    );
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function enrichTools() {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  dom.toolsHint.textContent = "正在调用模型总结…";
+  try {
+    const result = await callPost("tools/enrich", { only_missing: true });
+    const count = Object.keys(result.updated || {}).length;
+    const errors = result.errors || [];
+    if (count) {
+      showToast(
+        `已为 ${count} 个工具补充标签` +
+          `（缺标签候选 ${result.considered} 个，本次送 ${result.sent} 个）`,
+      );
+    }
+    if (errors.length) {
+      showError(`LLM 总结未完成：${errors.join("；")}`);
+    } else if (!count) {
+      showToast("没有需要补标签的工具（都已有标签）");
+    }
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 从已装插件导入为子插件                                              */
 /* ------------------------------------------------------------------ */
 
@@ -989,6 +1103,7 @@ function bindEvents() {
   dom.refreshButton.addEventListener("click", () => loadState(false));
   dom.searchButton.addEventListener("click", runSearch);
   dom.uploadButton.addEventListener("click", uploadSubplugin);
+  dom.enrichButton.addEventListener("click", enrichTools);
   dom.rescanButton.addEventListener("click", rescanSubplugins);
   dom.queryInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
