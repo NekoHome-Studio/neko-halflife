@@ -537,6 +537,7 @@ def main() -> int:
         for suffix, method in (
             ("subplugins/upload", "POST"),
             ("subplugins/delete", "POST"),
+            ("subplugins/rescan", "POST"),
             ("commands", "GET"),
             ("commands/rename", "POST"),
             ("commands/toggle", "POST"),
@@ -592,6 +593,33 @@ def main() -> int:
         check(
             REGISTRY.get("not_a_tool") is None,
             "零工具时没有在注册表里留下痕迹",
+        )
+
+        # ---- 手动往目录里放文件后，靠「重新扫描」加载 ----
+        # 这正是「什么都没发生、也没报错」的典型场景：本插件只在自己被加载/重载时
+        # 才扫一次目录，手动放的文件在重载前不会被发现。
+        (scratch / "manual_tools.py").write_text(
+            "@lazy_tool(name='manual_tool', tags=('manual',))\n"
+            "async def manual_tool(event, text: str) -> str:\n"
+            '    """手动放入的工具。\n\n    Args:\n        text(string): 内容\n    """\n'
+            "    return text\n",
+            encoding="utf-8",
+        )
+        check(
+            "manual_tool" not in REGISTRY.names(),
+            "前置条件：直接放文件不会自动加载（需要重扫或重载插件）",
+        )
+        plugin_main.request = FakeWebRequest({})
+        payload = body_of(asyncio.run(plugin.page_rescan_subplugins()))
+        check(
+            "manual_tools" in payload.get("loaded", []),
+            f"重新扫描后已加载：{payload.get('loaded')}",
+        )
+        check("manual_tools" in payload.get("added", []), "返回里标出了新增项")
+        check("manual_tool" in REGISTRY.names(), "重新扫描后工具已注册")
+        check(
+            payload.get("tools", {}).get("manual_tools") == 1,
+            f"按来源统计工具数：{payload.get('tools')}",
         )
 
         # ---- 上传：正常单文件 ----

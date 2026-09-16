@@ -610,3 +610,12 @@ input:focus {
 .import-actions {
   margin-top: 4px;
 }
+
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}

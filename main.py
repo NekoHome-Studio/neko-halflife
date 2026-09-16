@@ -426,6 +426,7 @@ class LazyToolsPlugin(Star):
             ("sources/toggle", self.page_toggle_source, ["POST"], "启用或停用子插件"),
             ("subplugins/upload", self.page_upload_subplugin, ["POST"], "上传并安装子插件"),
             ("subplugins/delete", self.page_delete_subplugin, ["POST"], "删除子插件"),
+            ("subplugins/rescan", self.page_rescan_subplugins, ["POST"], "重新扫描子插件目录"),
             ("plugin-import/candidates", self.page_import_candidates, ["GET"], "列出可导入的已装插件"),
             ("plugin-import/apply", self.page_import_apply, ["POST"], "把已装插件导入为子插件"),
             ("commands", self.page_commands, ["GET"], "列出指令及其别名/权限/启停"),
@@ -767,6 +768,56 @@ class LazyToolsPlugin(Star):
                 "bound_handlers": bound_handlers,
                 "indexed": self.index.size,
                 "kind": "zip" if is_zip else "single_file",
+            }
+        )
+
+    async def page_rescan_subplugins(self):
+        """重新扫描 ``sub_plugins/``：加载新增的、卸载已消失的、续接宿主、重建索引。
+
+        存在的理由：本插件**只在自己被加载/重载时**才会扫一次目录。如果有人用
+        scp / 手写的方式把子插件放进 ``sub_plugins/``，在插件重载之前什么都
+        不会发生——而且不报错，看起来就像"没反应"。这个接口让面板上点一下就能
+        完成扫描，不必去 AstrBot 的插件管理里重载整个插件。
+        """
+        before = set(self.loader.loaded)
+        await self._load_sub_plugins()
+        self._rebuild_index()
+        self.activation.drop_stale(frozenset(REGISTRY.names()))
+
+        discovered = sorted(self.loader.discover())
+        loaded = sorted(self.loader.loaded)
+        errors = {
+            name: self.loader.errors[name]
+            for name in loaded
+            if name in self.loader.errors
+        }
+        # 仅磁盘上存在、但没加载成功的（含被停用的）也报出来，便于定位
+        for name in discovered:
+            if name not in self.loader.loaded and name in self.loader.errors:
+                errors[name] = self.loader.errors[name]
+        tools = {
+            source: sum(1 for meta in REGISTRY.all() if meta.source == source)
+            for source in sorted(set(REGISTRY.sources()) | set(discovered))
+        }
+        added = sorted(set(loaded) - before)
+        removed = sorted(before - set(loaded))
+        logger.info(
+            "[neko-halflife] 重新扫描 sub_plugins/：磁盘 %d 个，已加载 %d 个，"
+            "新增 %s，消失 %s",
+            len(discovered),
+            len(loaded),
+            added or "无",
+            removed or "无",
+        )
+        return json_response(
+            {
+                "discovered": discovered,
+                "loaded": loaded,
+                "added": added,
+                "removed": removed,
+                "errors": errors,
+                "tools": tools,
+                "indexed": self.index.size,
             }
         )
 

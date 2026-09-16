@@ -82,6 +82,8 @@ const dom = {
   sourcesTitle: document.getElementById("sources-title"),
   sourcesHint: document.getElementById("sources-hint"),
   sourcesList: document.getElementById("sources-list"),
+  sourcesCount: document.getElementById("sources-count"),
+  rescanButton: document.getElementById("rescan-button"),
   sessionsTitle: document.getElementById("sessions-title"),
   sessionsSummary: document.getElementById("sessions-summary"),
   sessionsList: document.getElementById("sessions-list"),
@@ -313,8 +315,18 @@ function renderSources(sources, state) {
     "停用后其工具不再参与检索，也不会注入；状态会写回插件配置",
   );
 
+  const loaded = sources.filter((item) => item.loaded).length;
+  const tools = sources.reduce((sum, item) => sum + (item.tools || 0), 0);
+  dom.sourcesCount.textContent = `磁盘 ${sources.length} 个 · 已加载 ${loaded} 个 · 共 ${tools} 个工具`;
+
   if (!sources.length) {
-    dom.sourcesList.append(el("div", "empty", "sub_plugins/ 下还没有子插件。"));
+    dom.sourcesList.append(
+      el(
+        "div",
+        "empty",
+        "sub_plugins/ 下还没有子插件。若你是直接往目录里放的文件，点上面的「重新扫描目录」即可加载（本插件只在自己被加载/重载时才自动扫一次）。",
+      ),
+    );
     return;
   }
 
@@ -615,6 +627,32 @@ async function uploadSubplugin() {
   }
 }
 
+async function rescanSubplugins() {
+  if (busy) return;
+  setBusy(true);
+  clearError();
+  try {
+    const result = await callPost("subplugins/rescan", {});
+    const failures = Object.entries(result.errors || {});
+    if (failures.length) {
+      showError(
+        `扫描完成，但有 ${failures.length} 个子插件加载失败：\n- ` +
+          failures.map(([name, err]) => `${name} → ${err}`).join("\n- "),
+      );
+    } else {
+      showToast(
+        `扫描完成：磁盘 ${result.discovered.length} 个，已加载 ${result.loaded.length} 个` +
+          (result.added.length ? `，新增 ${result.added.join(", ")}` : ""),
+      );
+    }
+    await loadState(true);
+  } catch (error) {
+    showError(error?.message || String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function deleteSubplugin(name) {
   if (busy) return;
   if (!window.confirm(`删除子插件 ${name}？它的工具会一并从注册表移除。`)) return;
@@ -710,10 +748,22 @@ function importRow(item) {
     item.already_imported ? "覆盖导入" : "导入",
   );
   button.type = "button";
-  button.disabled = !item.portable || !item.target_name;
-  button.addEventListener("click", () =>
-    importPlugin(item.dir_name, item.already_imported),
-  );
+  // 刻意**不禁用**不可导入的按钮：禁用的按钮点下去毫无反馈，会让人以为"什么都没发生"。
+  // 保持可点，点了就把不能导入的原因明确摆出来。
+  button.addEventListener("click", () => {
+    if (!item.target_name) {
+      showError(`${item.dir_name} 的目录名不能作为子插件名，无法导入。`);
+      return;
+    }
+    if (!item.portable) {
+      showError(
+        `不能导入 ${item.dir_name}：\n- ` +
+          ((item.reasons || []).join("\n- ") || "原因未知（插件未给出说明）"),
+      );
+      return;
+    }
+    importPlugin(item.dir_name, item.already_imported);
+  });
   actions.append(button);
   row.append(actions);
 
@@ -939,6 +989,7 @@ function bindEvents() {
   dom.refreshButton.addEventListener("click", () => loadState(false));
   dom.searchButton.addEventListener("click", runSearch);
   dom.uploadButton.addEventListener("click", uploadSubplugin);
+  dom.rescanButton.addEventListener("click", rescanSubplugins);
   dom.queryInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
