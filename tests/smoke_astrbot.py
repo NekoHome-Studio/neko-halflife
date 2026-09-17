@@ -524,6 +524,40 @@ def main() -> int:
         f"代码读的每个配置项都在 schema 里（多余：{sorted(read_keys - schema_keys)}）",
     )
 
+    # 「总结模型」必须是 AstrBot 官方的可视化选取器，而不是让用户去手抄提供商 ID。
+    # 依据：docs/zh/dev/star/guides/plugin-config.md（_special 仅 v4.0.0+ 可用，
+    # select_provider 的结果是字符串）。本机 data/plugins 下多个插件也是这么写的。
+    provider_field = schema.get("llm_enrich_provider_id") or {}
+    check(
+        provider_field.get("_special") == "select_provider",
+        f"总结模型用官方选取器渲染：_special={provider_field.get('_special')!r}",
+    )
+    check(
+        provider_field.get("type") == "string",
+        "select_provider 返回字符串，配置类型必须一致（写成 list 会存成错误形状）",
+    )
+    # 官方文档点名了一批「内部实现、随时可能变动、请勿在插件中使用」的 _special
+    internal_special = {
+        "select_providers",
+        "provider_pool",
+        "persona_pool",
+        "select_plugin_set",
+        "t2i_template",
+        "get_embedding_dim",
+    }
+    used_special = {
+        str(field.get("_special"))
+        for field in schema.values()
+        if isinstance(field, dict) and field.get("_special")
+    }
+    check(
+        not (used_special & internal_special)
+        and not any(
+            item.startswith("select_agent_runner_provider") for item in used_special
+        ),
+        f"没有使用任何内部 _special（实际用到：{sorted(used_special)}）",
+    )
+
     print()
     print("13. 无改名残留（连字符与下划线两种写法都要查）")
     # 两处易漏点：日志前缀用的是连字符 [lazy-tools]，项目标识用的是下划线。

@@ -332,13 +332,21 @@ docstring 首段**——那些文字是写给**读代码的人**看的，往往�
 
 | 配置 | 作用 |
 |---|---|
-| `llm_enrich_provider_id` | 用哪个提供商。留空 = 当前会话默认模型 |
-| `llm_enrich_model` | 覆盖模型名。留空 = 用该提供商自己配置的模型 |
+| `llm_enrich_provider_id` | 用哪个提供商。留空 = 当前会话默认模型。**在 AstrBot 的插件配置页里是一个「选择对话模型」选取器**：列出你已经配好的模型（各自带着当前模型名，还能直接测连通性），不用手抄 ID |
+| `llm_enrich_model` | 覆盖模型名。一般不用填——选中的提供商本身就带着自己的模型；只有「同一个提供商换个模型」时才填 |
 
-面板的「工具清单 → 总结模型」下拉框就是这两项的图形化版本：选一个提供商、
-（可选）填一个模型名，点「测试」会**走真实的总结路径**跑一次——同一个 system
-prompt、同一个 JSON 解析，只是拿一个合成的 `neko_ping_tool` 去问，所以它通过
-就说明这条路真的通，而不是"能 ping 到"。确认可用后点「设为默认」写进插件配置。
+这个选取器用的是 AstrBot 官方的 `_special: select_provider`（v4.0.0+ 可用，
+`docs/zh/dev/star/guides/plugin-config.md` 里对插件公开），渲染链路是
+`ExtensionPage → AstrBotConfigV4 → ConfigItemRenderer → ProviderSelector`，
+返回值是提供商 **ID 字符串**——所以配置项类型必须是 `string`，写成 `list` 会存成
+错误的形状。官方另外点名了一批「内部实现、随时可能变动、请勿在插件中使用」的
+`_special` 值，测试里有一条断言防止误用。
+
+面板的「工具清单 → 总结模型」下拉框是同一件事的图形化版本，而且多一点：
+它读的是**运行时**的提供商列表，能对选中的组合跑一次**真实的总结调用**（同一个
+system prompt、同一个 JSON 解析，只是拿合成工具 `neko_ping_tool` 去问，所以通过
+就说明这条路真的通，而不是"能 ping 到"），确认可用后点「设为默认」写回上面这两个
+配置项。两边改的是同一份配置，不会各说各话。
 
 几个刻意的取舍：
 
@@ -486,8 +494,8 @@ LLM 总结不会把它冲掉，重启后依然在。
 | `llm_enrich_on_import` | true | 导入/上传后用 LLM 总结标签与描述。会消耗 token，失败只跳过 |
 | `llm_enrich_max_tools` | 20 | 单次最多总结几个工具；`0` 表示关闭 LLM 总结 |
 | `llm_enrich_timeout` | 60 | LLM 总结超时（秒）；超时跳过，不会卡住导入 |
-| `llm_enrich_provider_id` | `""` | 总结专用的提供商 ID。留空 = 当前会话默认模型；填了不存在的 ID 会明确报错而不是静默退回 |
-| `llm_enrich_model` | `""` | 总结时按次覆盖的模型名。留空 = 用该提供商自己的模型；**不会**改动全局配置里的模型 |
+| `llm_enrich_provider_id` | `""` | 总结专用的提供商。在插件配置页里渲染为**模型选取器**（`_special: select_provider`）；留空 = 当前会话默认模型。选中的提供商若被删除，会明确报错而不是静默退回 |
+| `llm_enrich_model` | `""` | 总结时按次覆盖的模型名。一般不用填（提供商自带模型）；**不会**改动全局配置里的模型 |
 | `learning_enabled` | true | 归纳学习总开关；关闭后不再采样，也不参与检索 |
 | `learning_max_examples` | 20 | 单个工具最多保留多少条学习样例（超出时保留命中最多的） |
 | `induction_min_hits` | 3 | 一个词至少在多少条**不同**样例里出现，才会被提议成标签 |
@@ -598,7 +606,7 @@ req.func_tool = 许可池中 (非本插件工具 ∪ keep)
 #    （无依赖，190 项）
 python tests/selftest.py
 
-# 2) 集成冒烟：真机验证注册契约、Web API、宿主模式、工具标签、总结模型与归纳学习（256 项）
+# 2) 集成冒烟：真机验证注册契约、Web API、宿主模式、工具标签、总结模型与归纳学习（259 项）
 #    需要能 import astrbot；用 ASTRBOT_SRC 指定源码根目录
 #    （刻意不用 ASTRBOT_ROOT——那是 AstrBot 自己的运行根目录变量）
 python tests/smoke_astrbot.py
@@ -637,6 +645,8 @@ python tests/smoke_astrbot.py
 * **总结模型**：断言请求里指定的提供商被调用而**会话默认那个没被牵连**、
   模型名是按次传入的、配置的 ID 失效时明确报错而不是静默换模型顶替、
   试跑走的是真实总结路径、`providers/save` 先验证再落盘；
+  另外校验配置项声明了官方的 `select_provider` 选取器且类型为 `string`，
+  以及没有误用官方的内部 `_special`；
 * **归纳学习**：真调一遍两个工具钩子，断言 `tool_result=None` **不算失败**、
   `isError=True` 才作废样例，`learning/forget` 能删掉单条、`auto_induct_tags`
   默认关闭而开启后生效；
@@ -682,7 +692,7 @@ git archive --format=zip -o dist/astrbot_plugin_neko_halflife-<ver>.zip HEAD
 
 | AstrBot | 核对方式 | 结果 |
 |---|---|---|
-| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与全部 20 个 Page 接口，含宿主模式、LLM 总结、总结模型选择与归纳学习端到端），446 项断言全绿 | 全部成立 |
+| **4.26.7** | 逐行读源码 ＋ `smoke_astrbot.py` **真机跑通**（真实导入 AstrBot、真实构造 `ToolSet`/`FunctionTool`、真实调用注入钩子与全部 20 个 Page 接口，含宿主模式、LLM 总结、总结模型选择与归纳学习端到端），449 项断言全绿 | 全部成立 |
 | **4.27.4** | 按上面五条逐条比对 tag `v4.27.4` 源码 | 全部成立 |
 
 4.27.4 的差异都落在本插件不依赖的地方：provider 选择改为 `get_using_provider_async`、

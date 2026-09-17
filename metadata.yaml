@@ -13,8 +13,9 @@ desc: >-
   检索支持标识符拆词（get_weather 也能被 weather 召回）、中文 bigram、错拼近似与单字兜底；
   并带归纳学习：模型真的用过的工具，会把那一轮的用户原话记成该工具的学习样例参与召回，
   反复出现的词可归纳成标签，全部可在 WebUI 面板里查看、删除与采纳。
-  总结工具标签所用的对话模型可单独指定（提供商与模型名），不必占用主力聊天模型。
-version: 0.7.0
+  总结工具标签所用的对话模型可单独指定（提供商与模型名），不必占用主力聊天模型；
+  该项在 AstrBot 插件配置页里是官方的模型选取器，不用手抄提供商 ID。
+version: 0.8.0
 author: NekoHome-Studio
 repo: https://github.com/NekoHome-Studio/neko-halflife
 astrbot_version: ">=4.26.7,<5"
